@@ -117,64 +117,6 @@ streamlit run app.py
 http://localhost:8501
 ```
 
-### 📖 사용 예제
-
-#### 1. PDF 논문 업로드 및 분석
-
-```python
-# API를 통한 직접 호출 예제
-import requests
-
-# 논문 업로드 및 즉시 질문
-files = {"file": ("paper.pdf", open("paper.pdf", "rb"), "application/pdf")}
-data = {"question": "이 논문에서 제안하는 모델의 구조를 설명해주세요"}
-
-response = requests.post(
-    "http://localhost:8000/documents/upload",
-    files=files,
-    data=data
-)
-
-result = response.json()
-print(f"생성된 코드 경로: {result['basecode_py_path']}")
-print(f"모델 요약: {result['basecode_summary']}")
-```
-
-#### 2. 생성된 코드 실행 예제
-
-```python
-# 생성된 코드 파일을 import하여 모델 빌드
-import sys
-sys.path.append('/path/to/generated/code')
-
-from transformer_basecode import build_model
-
-# 모델 생성
-model = build_model()
-print(model.summary())
-
-# 모델 컴파일 및 훈련
-model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
-# model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=10)
-```
-
-#### 3. 기존 문서에 추가 질문
-
-```python
-# 기존 문서에 대한 질문
-payload = {
-    "document_id": 1,
-    "question": "이 모델의 하이퍼파라미터 설정 방법은?"
-}
-
-response = requests.post(
-    "http://localhost:8000/qa/ask_existing",
-    json=payload
-)
-
-answer = response.json()["answer"]
-print(answer)
-```
 
 ### 🎨 지원하는 모델 템플릿
 
@@ -319,109 +261,6 @@ ai-paper-code-generator/
 └── 📄 README.md           # 이 파일
 ```
 
-### 🔧 새 템플릿 추가하기
-
-1. **템플릿 파일 생성**
-```bash
-# services/templates/에 새 .j2 파일 추가
-touch services/templates/my_model.j2
-```
-
-2. **템플릿 메타데이터 등록**
-```json
-// templates_manifest.json에 추가
-{
-    "file": "my_model.j2",
-    "path": "/full/path/to/my_model.j2", 
-    "family": "my_model",
-    "type": "slot",
-    "version": "v1",
-    "slots": ["encoder", "decoder", "head"],
-    "bytes": 1234
-}
-```
-
-3. **라우팅 규칙 추가**
-```python
-# services/routing.py에 라우팅 로직 추가
-def resolve_template_from_spec(spec: Dict[str, Any]) -> Tuple[str, Dict]:
-    # 새 모델 패밀리에 대한 라우팅 규칙 추가
-    pass
-```
-
-### 🧪 테스트
-
-```bash
-# 단위 테스트 실행
-python -m pytest tests/
-
-# 특정 테스트 실행  
-python -m pytest tests/test_codegen.py -v
-
-# 커버리지 측정
-python -m pytest --cov=services tests/
-```
-
-### 🐛 디버깅
-
-환경변수를 통한 디버그 모드 활성화:
-
-```bash
-export DEBUG_BASECODE=true
-export ROUTING_DEBUG=true
-export USE_LLM_ASSIST=false  # LLM 비활성화
-```
-
----
-
-## 🤝 기여 방법
-
-### 📝 기여 가이드라인
-
-1. **Fork & Clone**
-```bash
-git clone https://github.com/your-username/ai-paper-code-generator.git
-```
-
-2. **Feature Branch 생성**
-```bash
-git checkout -b feature/your-feature-name
-```
-
-3. **개발 및 테스트**
-```bash
-# 코드 작성
-# 테스트 추가/실행
-python -m pytest tests/
-```
-
-4. **코드 스타일 검사**
-```bash
-# Black 포맷팅
-black services/ backend/ 
-
-# Lint 검사
-flake8 services/ backend/
-```
-
-5. **Pull Request 생성**
-- 명확한 제목과 설명 작성
-- 변경사항에 대한 테스트 포함
-- 관련 이슈 번호 참조
-
-### 🐛 버그 리포트
-
-GitHub Issues를 통해 버그를 신고해 주세요:
-
-- **버그 설명**: 명확하고 간결한 설명
-- **재현 단계**: 단계별 재현 방법
-- **예상 결과**: 어떤 결과를 예상했는지
-- **실제 결과**: 실제로 어떤 일이 일어났는지
-- **환경 정보**: OS, Python 버전, 의존성 버전 등
-
-### 💡 기능 제안
-
-새로운 기능 아이디어가 있으시면 GitHub Discussions 또는 Issues를 통해 제안해 주세요.
 
 ---
 
@@ -452,15 +291,6 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
-
----
-
-## 📞 연락처 및 지원
-
-- **GitHub Issues**: 버그 신고 및 기능 요청
-- **GitHub Discussions**: 일반적인 질문 및 토론
-- **Email**: support@your-domain.com
-
 ---
 
 ## 🙏 감사의 말
@@ -475,6 +305,3 @@ SOFTWARE.
 - [SQLAlchemy](https://sqlalchemy.org/) - SQL 툴킷 및 ORM
 
 ---
-
-⭐ **이 프로젝트가 도움이 되셨다면 Star를 눌러주세요!** ⭐
-
