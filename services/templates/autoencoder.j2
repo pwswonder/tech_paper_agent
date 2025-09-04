@@ -1,0 +1,133 @@
+# -*- coding: utf-8 -*-
+# ============================================================================
+# Template: autoencoder.j2
+# Purpose : Convolutional/MLP AutoEncoder (2D input 기본) — reconstruction
+# Notes   :
+#   - compile(loss, metrics)는 상위 codegen._harden_metrics() 결과를 그대로 사용.
+#   - dims.*
+#       * latent_dim     : 잠재 차원 (기본 128)
+#       * conv_encoder   : True면 Conv2D 인코더/디코더, False면 MLP
+#       * hidden_units   : MLP 은닉 유닛 리스트 (기본 [256,128])
+#       * base_filters   : Conv 시작 채널 (기본 32), 단계별 x2
+#       * depth          : Conv 스택 깊이 (기본 3)
+#       * dropout        : Conv/MLP 공통 드롭아웃
+#   - LLM 슬롯:
+#       # {% raw %}{{CUSTOM_BLOCK:regularizer}}{% endraw %}  (latent/weights 정규화 추가 등)
+# ============================================================================
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+# {% raw %}{{CUSTOM_BLOCK:imports_extra}}{% endraw %}
+
+# ---------------------------
+# 1) Injected hyperparameters
+# ---------------------------
+input_shape     = {{ input_shape | default([64, 64, 3]) | tojson }}
+learning_rate   = {{ learning_rate | default(1e-3) }}
+optimizer_name  = {{ optimizer_name | default("adam") | tojson }}
+metrics         = {{ metrics | default(['mse']) | tojson }}
+loss_fn         = {{ loss | default("mse") | tojson }}
+
+latent_dim      = {{ (dims.latent_dim    | default(128)) }}
+conv_encoder    = {{ (dims.conv_encoder  | default(True))  | tojson }}
+hidden_units    = {{ (dims.hidden_units  | default([256, 128])) | tojson }}
+base_filters    = {{ (dims.base_filters  | default(32)) }}
+depth           = {{ (dims.depth         | default(3)) }}
+dropout_rate    = {{ (dims.dropout       | default(0.0)) }}
+
+# ---------------------------
+# 2) Blocks
+# ---------------------------
+def make_mlp_encoder(x):
+    for i, u in enumerate(list(hidden_units)):
+        x = layers.Dense(int(u), activation="relu", name=f"enc_dense{i+1}")(x)
+        if float(dropout_rate) > 0.0:
+            x = layers.Dropout(float(dropout_rate), name=f"enc_drop{i+1}")(x)
+    z = layers.Dense(int(latent_dim), name="z")(x)
+    # {% raw %}{{CUSTOM_BLOCK:regularizer}}{% endraw %}
+    return z
+
+def make_mlp_decoder(z, out_dim):
+    x = z
+    for i, u in enumerate(reversed(list(hidden_units))):
+        x = layers.Dense(int(u), activation="relu", name=f"dec_dense{i+1}")(x)
+        if float(dropout_rate) > 0.0:
+            x = layers.Dropout(float(dropout_rate), name=f"dec_drop{i+1}")(x)
+    x = layers.Dense(int(out_dim), activation="sigmoid", name="recon_dense")(x)
+    return x
+
+def make_conv_encoder(x):
+    f = int(base_filters)
+    # {% raw %}{{CUSTOM_BLOCK:encoder}}{% endraw %}
+    for d in range(int(depth)):
+        x = layers.Conv2D(f, 3, padding="same", use_bias=False, name=f"enc_c{d}_1")(x)
+        x = layers.BatchNormalization(name=f"enc_bn{d}_1")(x)
+        x = layers.Activation("relu", name=f"enc_relu{d}_1")(x)
+        x = layers.Conv2D(f, 3, padding="same", use_bias=False, name=f"enc_c{d}_2")(x)
+        x = layers.BatchNormalization(name=f"enc_bn{d}_2")(x)
+        x = layers.Activation("relu", name=f"enc_relu{d}_2")(x)
+        x = layers.MaxPool2D(2, name=f"enc_pool{d}")(x)
+        if float(dropout_rate) > 0.0:
+            x = layers.Dropout(float(dropout_rate), name=f"enc_drop{d}")(x)
+        f *= 2
+    x = layers.Conv2D(int(latent_dim), 1, padding="same", name="enc_proj")(x)
+    return x
+
+def make_conv_decoder(z):
+    f = int(base_filters) * (2 ** (int(depth) - 1))
+    x = z
+    # {% raw %}{{CUSTOM_BLOCK:decoder}}{% endraw %}
+    for d in reversed(range(int(depth))):
+        x = layers.Conv2D(f, 3, padding="same", use_bias=False, name=f"dec_c{d}_1")(x)
+        x = layers.BatchNormalization(name=f"dec_bn{d}_1")(x)
+        x = layers.Activation("relu", name=f"dec_relu{d}_1")(x)
+        x = layers.Conv2D(f, 3, padding="same", use_bias=False, name=f"dec_c{d}_2")(x)
+        x = layers.BatchNormalization(name=f"dec_bn{d}_2")(x)
+        x = layers.Activation("relu", name=f"dec_relu{d}_2")(x)
+        x = layers.UpSampling2D(2, name=f"dec_up{d}")(x)
+        if float(dropout_rate) > 0.0:
+            x = layers.Dropout(float(dropout_rate), name=f"dec_drop{d}")(x)
+        f //= 2
+    x = layers.Conv2D(int(input_shape[-1]), 1, activation="sigmoid", name="recon")(x)
+    return x
+
+# ---------------------------
+# 3) Entry
+# ---------------------------
+def build_model():
+    if bool(conv_encoder):
+        inputs = keras.Input(shape=tuple(input_shape), name="inputs")
+        z = make_conv_encoder(inputs)
+        outputs = make_conv_decoder(z)
+    else:
+        flat_dim = 1
+        for n in list(input_shape):
+            flat_dim *= int(n)
+        inputs = keras.Input(shape=tuple(input_shape), name="inputs")
+        x = layers.Flatten(name="flatten")(inputs)
+        z = make_mlp_encoder(x)
+        out = make_mlp_decoder(z, flat_dim)
+        outputs = layers.Reshape(tuple(input_shape), name="recon_reshape")(out)
+
+    # {% raw %}{{CUSTOM_BLOCK:head}}{% endraw %}
+    model = keras.Model(inputs, outputs, name="autoencoder")
+
+    opt = optimizer_name
+    if isinstance(optimizer_name, str):
+        name = optimizer_name.lower()
+        if name == "adam":
+            opt = keras.optimizers.Adam(learning_rate=learning_rate)
+        elif name == "sgd":
+            opt = keras.optimizers.SGD(learning_rate=learning_rate, momentum=0.9)
+        elif name == "rmsprop":
+            opt = keras.optimizers.RMSprop(learning_rate=learning_rate)
+        else:
+            try:
+                opt = keras.optimizers.get(optimizer_name)
+            except Exception:
+                opt = keras.optimizers.Adam(learning_rate=learning_rate)
+
+    # {% raw %}{{CUSTOM_BLOCK:compile_override}}{% endraw %}
+    model.compile(optimizer=opt, loss=loss_fn, metrics=metrics)
+    return model

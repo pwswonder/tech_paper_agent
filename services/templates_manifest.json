@@ -1,0 +1,300 @@
+[
+  {
+    "file": "autoencoder.j2",
+    "path": "/Users/a11687/Documents/my_aiagent_project/autoencoder.j2",
+    "family": "autoencoder",
+    "type": "slot",
+    "version": "v1",
+    "slots": [
+      "compile_override",
+      "decoder",
+      "encoder",
+      "head",
+      "imports_extra",
+      "regularizer"
+    ],
+    "bytes": 5920
+  },
+  {
+    "file": "cnn_family.j2",
+    "path": "/Users/a11687/Documents/my_aiagent_project/cnn_family.j2",
+    "family": "cnn_family",
+    "type": "slot",
+    "version": "v1",
+    "slots": [
+      "compile_override",
+      "head",
+      "imports_extra",
+      "inception_mixed",
+      "se_squeeze_excitation",
+      "stages",
+      "stochastic_depth"
+    ],
+    "bytes": 10701
+  },
+  {
+    "file": "gan.j2",
+    "path": "/Users/a11687/Documents/my_aiagent_project/gan.j2",
+    "family": "gan",
+    "type": "slot",
+    "version": "v1",
+    "slots": [
+      "compile_override",
+      "discriminator_block",
+      "gan_loss",
+      "generator_blocks",
+      "imports_extra"
+    ],
+    "bytes": 6451
+  },
+  {
+    "file": "resnet.j2",
+    "path": "/Users/a11687/Documents/my_aiagent_project/resnet.j2",
+    "family": "resnet",
+    "type": "slot",
+    "version": "v1",
+    "slots": [
+      "compile_override",
+      "head",
+      "imports_extra",
+      "stages"
+    ],
+    "bytes": 9896
+  },
+  {
+    "file": "rnn_seq.j2",
+    "path": "/Users/a11687/Documents/my_aiagent_project/rnn_seq.j2",
+    "family": "rnn_seq",
+    "type": "slot",
+    "version": "v1",
+    "slots": [
+      "attention_mech",
+      "compile_override",
+      "head",
+      "imports_extra",
+      "rnn_stack",
+      "schedule"
+    ],
+    "bytes": 7004
+  },
+  {
+    "file": "autoencoder.j2",
+    "path": "/Users/a11687/Documents/my_aiagent_project/services/templates/autoencoder.j2",
+    "family": "autoencoder",
+    "type": "slot",
+    "version": "v1",
+    "slots": [
+      "compile_override",
+      "decoder",
+      "encoder",
+      "head",
+      "imports_extra",
+      "regularizer"
+    ],
+    "bytes": 5920
+  },
+  {
+    "file": "cnn_family.j2",
+    "path": "/Users/a11687/Documents/my_aiagent_project/services/templates/cnn_family.j2",
+    "family": "cnn_family",
+    "type": "slot",
+    "version": "v1",
+    "slots": [
+      "compile_override",
+      "head",
+      "imports_extra",
+      "inception_mixed",
+      "se_squeeze_excitation",
+      "stages",
+      "stochastic_depth"
+    ],
+    "bytes": 10701
+  },
+  {
+    "file": "gan.j2",
+    "path": "/Users/a11687/Documents/my_aiagent_project/services/templates/gan.j2",
+    "family": "gan",
+    "type": "slot",
+    "version": "v1",
+    "slots": [
+      "compile_override",
+      "discriminator_block",
+      "gan_loss",
+      "generator_blocks",
+      "imports_extra"
+    ],
+    "bytes": 6451
+  },
+  {
+    "file": "resnet.j2",
+    "path": "/Users/a11687/Documents/my_aiagent_project/services/templates/resnet.j2",
+    "family": "resnet",
+    "type": "slot",
+    "version": "v1",
+    "slots": [
+      "compile_override",
+      "head",
+      "imports_extra",
+      "stages"
+    ],
+    "bytes": 9896
+  },
+  {
+    "file": "rnn_seq.j2",
+    "path": "/Users/a11687/Documents/my_aiagent_project/services/templates/rnn_seq.j2",
+    "family": "rnn_seq",
+    "type": "slot",
+    "version": "v1",
+    "slots": [
+      "attention_mech",
+      "compile_override",
+      "head",
+      "imports_extra",
+      "rnn_stack",
+      "schedule"
+    ],
+    "bytes": 7004
+  },
+  {
+    "file": "swin.j2",
+    "path": "/Users/a11687/Documents/my_aiagent_project/services/templates/swin.j2",
+    "family": "swin",
+    "type": "slot",
+    "version": "v1",
+    "slots": [
+      "imports_extra",
+      "stages"
+    ],
+    "bytes": 708
+  },
+  {
+    "file": "transformer.j2",
+    "path": "/Users/a11687/Documents/my_aiagent_project/services/templates/transformer.j2",
+    "family": "transformer",
+    "type": "slot",
+    "version": "v1",
+    "slots": [
+      "decoder_layers",
+      "encoder_layers",
+      "imports_extra"
+    ],
+    "bytes": 283
+  },
+  {
+    "file": "transformer_mt.j2",
+    "path": "/Users/a11687/Documents/my_aiagent_project/services/templates/transformer_mt.j2",
+    "family": "transformer_mt",
+    "type": "slot",
+    "version": "v1",
+    "slots": [
+      "decoder_layers",
+      "encoder_layers",
+      "imports_extra"
+    ],
+    "bytes": 279
+  },
+  {
+    "file": "unet.j2",
+    "path": "/Users/a11687/Documents/my_aiagent_project/services/templates/unet.j2",
+    "family": "unet",
+    "type": "slot",
+    "version": "v1",
+    "slots": [
+      "compile_override",
+      "decoder_blocks",
+      "encoder_blocks",
+      "head",
+      "imports_extra"
+    ],
+    "bytes": 4484
+  },
+  {
+    "file": "vae.j2",
+    "path": "/Users/a11687/Documents/my_aiagent_project/services/templates/vae.j2",
+    "family": "vae",
+    "type": "slot",
+    "version": "v1",
+    "slots": [
+      "compile_override",
+      "decoder",
+      "encoder",
+      "head",
+      "imports_extra",
+      "kl_anneal",
+      "latent"
+    ],
+    "bytes": 7253
+  },
+  {
+    "file": "swin.j2",
+    "path": "/Users/a11687/Documents/my_aiagent_project/swin.j2",
+    "family": "swin",
+    "type": "slot",
+    "version": "v1",
+    "slots": [
+      "imports_extra",
+      "stages"
+    ],
+    "bytes": 721
+  },
+  {
+    "file": "transformer.j2",
+    "path": "/Users/a11687/Documents/my_aiagent_project/transformer.j2",
+    "family": "transformer",
+    "type": "slot",
+    "version": "v1",
+    "slots": [
+      "compile_override",
+      "decoder_layers",
+      "encoder_layers",
+      "imports_extra"
+    ],
+    "bytes": 6007
+  },
+  {
+    "file": "transformer_mt.j2",
+    "path": "/Users/a11687/Documents/my_aiagent_project/transformer_mt.j2",
+    "family": "transformer_mt",
+    "type": "slot",
+    "version": "v1",
+    "slots": [
+      "compile_override",
+      "decoder_layers",
+      "encoder_layers",
+      "imports_extra"
+    ],
+    "bytes": 7837
+  },
+  {
+    "file": "unet.j2",
+    "path": "/Users/a11687/Documents/my_aiagent_project/unet.j2",
+    "family": "unet",
+    "type": "slot",
+    "version": "v1",
+    "slots": [
+      "compile_override",
+      "decoder_blocks",
+      "encoder_blocks",
+      "head",
+      "imports_extra"
+    ],
+    "bytes": 4484
+  },
+  {
+    "file": "vae.j2",
+    "path": "/Users/a11687/Documents/my_aiagent_project/vae.j2",
+    "family": "vae",
+    "type": "slot",
+    "version": "v1",
+    "slots": [
+      "compile_override",
+      "decoder",
+      "encoder",
+      "head",
+      "imports_extra",
+      "kl_anneal",
+      "latent"
+    ],
+    "bytes": 7253
+  }
+]

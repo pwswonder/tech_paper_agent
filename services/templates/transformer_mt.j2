@@ -1,0 +1,176 @@
+# -*- coding: utf-8 -*-
+# ============================================================================
+# Template: transformer_mt.j2
+# Purpose : Machine Translation (Seq2Seq) Transformer (Keras 3 safe)
+# ============================================================================
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+# {% raw %}{{CUSTOM_BLOCK:imports_extra}}{% endraw %}
+
+# ---------------------------
+# 1) 하이퍼파라미터 (spec에서 주입)
+# ---------------------------
+vocab_size   = {{ dims.vocab_size | default(32000) }}
+max_len      = {{ dims.max_len    | default(128) }}
+d_model      = {{ dims.hidden_dim | default(512) }}
+num_heads    = {{ dims.num_heads  | default(8) }}
+ffn_dim      = {{ dims.ffn_dim    | default(2048) }}
+num_layers   = {{ dims.num_layers | default(6) }}
+dropout_rate = {{ dims.dropout    | default(0.1) }}
+
+learning_rate  = {{ learning_rate | default(1e-3) }}
+optimizer_name = {{ optimizer_name | default("adam") | tojson }}
+metrics        = {{ metrics | default(['accuracy']) | tojson }}
+loss_fn        = {{ loss | default("sparse_categorical_crossentropy") | tojson }}
+
+# ---------------------------
+# 2) 유틸 레이어들 (tf.*는 모두 call() 안에서만 사용)
+# ---------------------------
+class SinePositionalEncoding(layers.Layer):
+    """논문식 사인/코사인 위치 인코딩을 x와 같은 dtype으로 반환."""
+    def __init__(self, d_model, **kwargs):
+        super().__init__(**kwargs)
+        self.d_model = int(d_model)
+
+    def call(self, x):
+        # x: (B, T, d_model)
+        dtype = x.dtype if x.dtype is not None else tf.float32
+        seq_len = tf.shape(x)[1]
+
+        # i: [0..d_model-1] (정수), parity mask
+        i_int = tf.range(self.d_model, dtype=tf.int32)
+        parity = tf.math.mod(i_int, 2)                            # 0(짝), 1(홀)
+        mask_even = tf.cast(tf.equal(parity, 0), dtype)[tf.newaxis, :]  # (1, d_model)
+        mask_odd  = 1.0 - mask_even
+
+        # 각 위치/차원 각도
+        # exponent = (2 * floor(i/2)) / d_model
+        exponent = tf.cast(2 * (i_int // 2), dtype) / tf.cast(self.d_model, dtype)
+        angle_rates = tf.cast(1.0, dtype) / tf.pow(tf.cast(10000.0, dtype), exponent)  # (d_model,)
+
+        positions = tf.cast(tf.range(seq_len), dtype)[:, tf.newaxis]  # (T, 1)
+        angles = positions * angle_rates[tf.newaxis, :]               # (T, d_model)
+
+        # 짝수 차원은 sin, 홀수 차원은 cos
+        pos_enc = tf.sin(angles) * mask_even + tf.cos(angles) * mask_odd  # (T, d_model)
+        pos_enc = tf.expand_dims(pos_enc, 0)                               # (1, T, d_model)
+
+        return x + pos_enc
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
+class TokenEmbedding(layers.Layer):
+    """토큰 임베딩 + sqrt(d_model) 스케일 (dtype 안전)."""
+    def __init__(self, vocab_size, d_model, **kwargs):
+        super().__init__(**kwargs)
+        self.d_model = int(d_model)
+        self.emb = layers.Embedding(vocab_size, self.d_model)
+
+    def call(self, x):
+        y = self.emb(x)  # float32
+        scale = tf.sqrt(tf.cast(self.d_model, y.dtype))
+        return y * scale
+
+class FeedForward(layers.Layer):
+    def __init__(self, d_model, ffn_dim, dropout, **kwargs):
+        super().__init__(**kwargs)
+        self.net = keras.Sequential([
+            layers.Dense(ffn_dim, activation='relu'),
+            layers.Dropout(dropout),
+            layers.Dense(d_model),
+        ])
+
+    def call(self, x, training=False):
+        return self.net(x, training=training)
+
+class EncoderLayer(layers.Layer):
+    def __init__(self, d_model, num_heads, ffn_dim, dropout, **kwargs):
+        super().__init__(**kwargs)
+        head_dim = max(1, int(d_model) // int(num_heads))
+        self.mha   = layers.MultiHeadAttention(num_heads=num_heads, key_dim=head_dim, dropout=dropout)
+        self.ffn   = FeedForward(d_model, ffn_dim, dropout)
+        self.norm1 = layers.LayerNormalization(epsilon=1e-6)
+        self.norm2 = layers.LayerNormalization(epsilon=1e-6)
+        self.drop  = layers.Dropout(dropout)
+
+    def call(self, x, training=False, mask=None):
+        h = self.norm1(x)
+        attn_out = self.mha(h, h, attention_mask=mask, training=training)
+        x = x + self.drop(attn_out, training=training)
+        h2 = self.norm2(x)
+        ffn_out = self.ffn(h2, training=training)
+        x = x + self.drop(ffn_out, training=training)
+        return x
+
+class DecoderLayer(layers.Layer):
+    def __init__(self, d_model, num_heads, ffn_dim, dropout, **kwargs):
+        super().__init__(**kwargs)
+        head_dim = max(1, int(d_model) // int(num_heads))
+        self.self_mha  = layers.MultiHeadAttention(num_heads=num_heads, key_dim=head_dim, dropout=dropout)
+        self.cross_mha = layers.MultiHeadAttention(num_heads=num_heads, key_dim=head_dim, dropout=dropout)
+        self.ffn   = FeedForward(d_model, ffn_dim, dropout)
+        self.norm1 = layers.LayerNormalization(epsilon=1e-6)
+        self.norm2 = layers.LayerNormalization(epsilon=1e-6)
+        self.norm3 = layers.LayerNormalization(epsilon=1e-6)
+        self.drop  = layers.Dropout(dropout)
+
+    def call(self, x, enc_out, training=False, self_mask=None, encdec_mask=None):
+        attn1 = self.self_mha(x, x, attention_mask=self_mask, use_causal_mask=True, training=training)
+        x = self.norm1(x + self.drop(attn1, training=training))
+        attn2 = self.cross_mha(x, enc_out, attention_mask=encdec_mask, training=training)
+        x = self.norm2(x + self.drop(attn2, training=training))
+        ffn_out = self.ffn(x, training=training)
+        x = self.norm3(x + self.drop(ffn_out, training=training))
+        return x
+
+# ---------------------------
+# 3) 모델 구성
+# ---------------------------
+def build_model():
+    # 입력: (batch, seq_len) 정수 토큰
+    src = keras.Input(shape=(None,), dtype="int32", name="src_tokens")
+    tgt = keras.Input(shape=(None,), dtype="int32", name="tgt_tokens")
+
+    # 임베딩 + 위치인코딩 (dtype 안전)
+    src_x = TokenEmbedding(vocab_size, d_model, name="src_tok_emb")(src)
+    src_x = SinePositionalEncoding(d_model, name="src_posenc")(src_x)
+    src_x = layers.Dropout(dropout_rate)(src_x)
+
+    tgt_x = TokenEmbedding(vocab_size, d_model, name="tgt_tok_emb")(tgt)
+    tgt_x = SinePositionalEncoding(d_model, name="tgt_posenc")(tgt_x)
+    tgt_x = layers.Dropout(dropout_rate)(tgt_x)
+
+    # 인코더 스택
+    for i in range(num_layers):
+        src_x = EncoderLayer(d_model, num_heads, ffn_dim, dropout_rate, name=f"enc_{i}")(src_x)
+
+    # 디코더 스택
+    # 디코더 스택 (slot-injected)
+    enc = src_x     # alias for cross-attention memory
+    x   = tgt_x     # alias for decoder input
+    # {% raw %}{{CUSTOM_BLOCK:decoder_layers}}{% endraw %}
+    tgt_x = x       # restore back to template variable
+    # 출력 로짓
+    logits = layers.Dense(vocab_size, name="lm_head")(tgt_x)
+
+    model = keras.Model(inputs=[src, tgt], outputs=logits, name="transformer_seq2seq")
+
+    # Optimizer
+    optimizer = optimizer_name
+    if isinstance(optimizer_name, str):
+        low = optimizer_name.lower()
+        if low == "adam":
+            optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
+        elif low == "sgd":
+            optimizer = keras.optimizers.SGD(learning_rate=learning_rate, momentum=0.9)
+        elif low == "rmsprop":
+            optimizer = keras.optimizers.RMSprop(learning_rate=learning_rate)
+        else:
+            optimizer = keras.optimizers.get(optimizer_name)
+
+    # {% raw %}{{CUSTOM_BLOCK:compile_override}}{% endraw %}
+    model.compile(optimizer=optimizer, loss=loss_fn, metrics=metrics)
+    return model

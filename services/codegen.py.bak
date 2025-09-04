@@ -1,0 +1,859 @@
+# -*- coding: utf-8 -*-
+"""
+services/codegen.py
+
+기능 요약
+- templates_manifest.json을 읽어 템플릿을 찾고
+- Jinja2 렌더링으로 .py 소스코드를 생성
+- 'metrics'는 반드시 리스트 리터럴로 강제 (태스크별 기본값 보정)
+- 로컬에 생성된 .py를 import하여 build_model()을 호출할 수 있게 유틸 제공
+
+안전장치
+- StrictUndefined로 오타/누락 변수 잡기
+- tojson 필터를 명시적으로 등록
+- Jinja 제어문 {% for %}는 템플릿 설계에서 사용 금지(검사 포함)
+"""
+
+import importlib.util
+import json
+import os
+import re
+import sys
+from types import ModuleType
+from typing import Any, Dict, List, Tuple
+
+from jinja2 import Environment, FileSystemLoader, StrictUndefined
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+
+# 파일 상단 근처 (기존 import들 아래)
+import logging
+from pathlib import Path
+from typing import Any, Dict, Tuple
+
+from services.lib.slot_payload_resolver import resolve_payloads_for_template
+from services.lib.utils_slot_apply import apply_custom_blocks
+
+
+# [ADDED] llm 폴백 가져오기 (안되면 None)
+try:
+    from services.llm_codegen_assist import generate_basecode_fallback
+except Exception:
+    generate_basecode_fallback = None
+
+
+# === BEGIN: auto-block imports ===
+try:
+    from services.codegen_autoblocks import autofill_custom_blocks
+except Exception:
+    try:
+        from codegen_autoblocks import autofill_custom_blocks  # type: ignore
+    except Exception:
+        autofill_custom_blocks = lambda spec, family=None: spec  # no-op
+# === END: auto-block imports ===
+
+
+# 프로젝트 루트 기준 상대 경로
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+TEMPLATE_DIR = os.path.join(PROJECT_ROOT, "services", "templates")
+MANIFEST_PATH = os.path.join(PROJECT_ROOT, "templates_manifest.json")
+GENERATED_DIR = os.path.join(PROJECT_ROOT, ".generated")  # 생성된 .py 파일 보관 폴더
+os.makedirs(GENERATED_DIR, exist_ok=True)
+
+
+# ---------------------------
+# 1) 헬퍼: Jinja 환경 구성
+# ---------------------------
+def _make_env(template_dir: str) -> Environment:
+    env = Environment(
+        loader=FileSystemLoader(template_dir),
+        autoescape=False,
+        trim_blocks=True,
+        lstrip_blocks=True,
+        undefined=StrictUndefined,  # 누락 변수/오타 빠르게 찾기
+    )
+    env.filters["tojson"] = lambda x: json.dumps(x, ensure_ascii=False)
+
+    # [ADDED] pylit: 파이썬 리터럴로 안전 주입
+    def _pylit(x):  # bool/null 등 JSON 잔재 방지
+        return (
+            json.dumps(x, ensure_ascii=False)
+            .replace("true", "True")
+            .replace("false", "False")
+            .replace("null", "None")
+        )
+
+    env.filters["pylit"] = _pylit
+    return env
+
+
+# ---------------------------
+# 1-1) 템플릿 키 별칭
+# ---------------------------
+# [ADDED] 동일 alias 테이블 (최소 중복 허용)
+_TEMPLATE_ALIAS = {
+    "cnn": "cnn_family",
+    "vgg": "cnn_family",
+    "mobilenet": "cnn_family",
+    "efficientnet": "cnn_family",
+    "inception": "cnn_family",
+    "rnn": "rnn_seq",
+    "lstm": "rnn_seq",
+    "gru": "rnn_seq",
+}
+
+# ---------------------------
+# 1-2) LLM 보조(옵션) + 커스텀 슬롯 처리
+# ---------------------------
+try:
+    from services import llm_codegen_assist as lga  # [ADDED]
+
+    _LLM_OK = True  # [ADDED]
+except Exception:
+    _LLM_OK = False  # [ADDED]
+
+# [ADDED] 인라인 슬롯도 잡아내는 정규식: 들여쓰기/후행 텍스트까지 캡처
+_SLOT_LINE_RE = re.compile(r'''(?m)^(?P<indent>[ \t]*)#\s*(?:\{\%\s*raw\s*\%\}\s*)?\{\{CUSTOM_BLOCK:(?P<name>[A-Za-z0-9_\-]+)\}\}(?:\s*\{\%\s*endraw\s*\%\})?(?P<trail>[^\n]*)?$''')^(?P<indent>[ \t]*)#\s*\{\{CUSTOM_BLOCK:(?P<name>[a-zA-Z0-9_\-]+)\}\}(?P<trail>[^\n]*)?$"
+)
+
+
+# [ADDED] 들여쓰기 적용 유틸
+def _indent_block(code: str, indent: str) -> str:
+    if not code:
+        return ""
+    lines = code.splitlines()
+    return "".join((indent + ln if ln.strip() else ln) + "\n" for ln in lines)
+
+
+# [MODIFIED] 슬롯 치환: LLM OFF여도 문법 안전 (인라인이면 줄 분리)
+def _fill_custom_blocks(source: str, spec: Dict[str, Any]) -> str:
+    """
+    템플릿 소스 내 '# {{CUSTOM_BLOCK:slot}}...' 라인을
+    - LLM 사용 시: 합성 코드로 교체 + 들여쓰기 적용
+    - LLM 미사용 시: 안전한 주석 라인으로 대체하고, 같은 줄에 붙은 후행 코드(trail)는 새 줄에 분리
+    """
+
+    def _repl(m: re.Match) -> str:
+        indent = m.group("indent") or ""
+        name = m.group("name")
+        trail = (m.group("trail") or "").lstrip()  # 같은 줄 뒤쪽 코드 (예: 'try:')
+
+        if _LLM_OK:
+            try:
+                blk = lga.synthesize_block(name, spec)  # .code: str
+                code = _indent_block(blk.code or "", indent)
+                # 합성 결과 뒤에, 같은 들여쓰기로 trail을 새 줄에 보존
+                if trail:
+                    code += f"{indent}{trail}\n"
+                if not code:
+                    # 합성 실패 시 안전 주석
+                    code = f"{indent}# [CUSTOM_BLOCK:{name}] (empty)\n"
+                    if trail:
+                        code += f"{indent}{trail}\n"
+                return code
+            except Exception:
+                # 실패 시에도 안전 주석 + trail 보존
+                out = f"{indent}# [CUSTOM_BLOCK:{name}] (error)\n"
+                if trail:
+                    out += f"{indent}{trail}\n"
+                return out
+        else:
+            # LLM OFF: 슬롯 자리는 주석으로 남기고, trail은 새 줄로 분리
+            out = f"{indent}# [CUSTOM_BLOCK:{name}] (skipped)\n"
+            if trail:
+                out += f"{indent}{trail}\n"
+            return out
+
+    return _SLOT_LINE_RE.sub(_repl, source)
+
+
+# ---------------------------
+# 1-3) 태스크 감지
+# ---------------------------
+def _is_nlp_seq2seq(spec: Dict[str, Any]) -> bool:
+    task = str(spec.get("task_type") or "").strip().lower()
+    subtype = str(spec.get("subtype") or "").strip().lower()
+    modality = str(spec.get("data_modality") or "").strip().lower()
+    if subtype in {"encoderdecoder", "seq2seq"}:
+        return True
+    if task in {"machine_translation", "sequence_to_sequence"}:
+        return True
+    if modality == "text" and task in {"translation", "text_generation"}:
+        return True
+    return False
+
+
+# ---------------------------
+# 2) 메트릭스 하드닝
+# ---------------------------
+def _harden_metrics(spec: Dict[str, Any]) -> None:
+    """
+    spec 안의 metrics 값을 '리스트 리터럴'로 강제.
+    - 번역/생성/분류: 기본 ['accuracy'] + loss 'sparse_categorical_crossentropy'
+    - 그 외: 기본 ['mse'] + loss 'mse'
+    """
+    task = str(spec.get("task_type") or "").strip().lower()
+
+    if "metrics" not in spec or spec["metrics"] in (None, "", []):
+        spec["metrics"] = []
+    elif isinstance(spec["metrics"], str):
+        spec["metrics"] = [spec["metrics"]]
+    elif not isinstance(spec["metrics"], (list, tuple)):
+        spec["metrics"] = []
+
+    metrics_norm: List[str] = []
+    for m in spec["metrics"]:
+        try:
+            metrics_norm.append(str(m).strip().lower())
+        except Exception:
+            continue
+
+    is_cls_or_mt = task in {
+        "machine_translation",
+        "sequence_to_sequence",
+        "text_generation",
+        "classification",
+    }
+
+    if is_cls_or_mt:
+        if not metrics_norm:
+            metrics_norm = ["accuracy"]
+        elif all(
+            x not in {"acc", "accuracy", "sparse_categorical_accuracy"}
+            for x in metrics_norm
+        ):
+            metrics_norm.append("accuracy")
+    else:
+        if not metrics_norm:
+            metrics_norm = ["mse"]
+
+    spec["metrics"] = metrics_norm
+
+    loss = str(spec.get("objective") or spec.get("loss") or "").strip().lower()
+    if not loss:
+        spec["loss"] = "sparse_categorical_crossentropy" if is_cls_or_mt else "mse"
+    else:
+        spec["loss"] = loss
+
+
+# ---------------------------
+# [ADDED] dims 보강: 상위 키 승격
+# ---------------------------
+def _ensure_dims(spec: Dict[str, Any]) -> None:
+    dims = spec.get("dims")
+    if not isinstance(dims, dict):
+        dims = {}
+        spec["dims"] = dims
+    promote_keys = [
+        "vocab_size",
+        "max_len",
+        "hidden_dim",
+        "num_heads",
+        "ffn_dim",
+        "num_layers",
+        "dropout",
+        "input_is_tokens",
+        "input_shape",
+        "num_classes",
+        "embedding_dim",
+        "base_filters",
+        "depth",
+        "use_batchnorm",
+        "stem_filters",
+        "stage_blocks",
+        "stage_filters",
+        "bottleneck",
+        "use_se",
+        "se_reduction",
+        "stochastic_depth_p",
+        "kernel_size",
+        "dilation",
+    ]
+    for k in promote_keys:
+        if k in spec and k not in dims:
+            dims[k] = spec[k]
+
+
+# ---------------------------
+# 공통: 텍스트 정리/프리플라이트
+# ---------------------------
+_FENCE_LINE = re.compile(r"(?m)^\s*```[a-zA-Z0-9_]*\s*$")
+_NOTEBOOK_MAGIC = re.compile(r"(?m)^\s*%%[a-zA-Z0-9_]+\s*$")
+# [ADDED] 간단 sanitize 패턴들
+_SANITIZE_PATTERNS: List[Tuple[re.Pattern, str]] = [
+    (re.compile(r"\btrue\b"), "True"),
+    (re.compile(r"\bfalse\b"), "False"),
+    (re.compile(r"\bnull\b"), "None"),
+]
+
+
+# ---------------------------
+# 슬롯+코드 한 줄 정규화: "# {{CUSTOM_BLOCK:...}} <code>" → 두 줄로 분리
+# ---------------------------
+_SLOT_SPLIT_RE = re.compile(
+    r"^(?P<indent>[ \t]*)#\s*(?P<marker>(?:\{\{\s*CUSTOM_BLOCK:[^}]+\}\}))\s*(?P<rest>.+\S.*)$",
+    re.M,
+)
+
+
+def _normalize_custom_slot_lines(py_source: str) -> str:
+    # 탭 → 스페이스
+    s = py_source.replace("\t", "    ")
+
+    def _repl(m):
+        indent = m.group("indent")
+        marker = m.group("marker")
+        rest = m.group("rest")
+        # 이미 다음 줄에 코드가 분리돼 있다면 건너뜀 (보수적)
+        if rest.strip().startswith("# {{CUSTOM_BLOCK:"):
+            return m.group(0)
+        return f"{indent}# {marker}\n{indent}{rest}\n"
+
+    return _SLOT_SPLIT_RE.sub(_repl, s)
+
+
+def _sanitize_source(py_source: str) -> str:
+    s = py_source
+    for pat, repl in _SANITIZE_PATTERNS:
+        s = pat.sub(repl, s)
+    s = _FENCE_LINE.sub("", s)
+    s = _NOTEBOOK_MAGIC.sub("", s)
+    return s
+
+
+def _preflight_check_source(src: str, fname: str = "<generated>") -> None:
+    try:
+        compile(src, fname, "exec")
+    except SyntaxError as e:
+        lines = src.splitlines()
+        i = (e.lineno or 1) - 1
+        ctx = "\n".join(
+            f"{n+1:>4}: {lines[n]}"
+            for n in range(max(0, i - 3), min(len(lines), i + 4))
+        )
+        raise SyntaxError(
+            f"{e.msg} at {fname}:{e.lineno}\n---- context ----\n{ctx}\n-----------------"
+        ) from None
+
+
+# ---------------------------
+# 3) 템플릿 렌더 → .py 생성
+# ---------------------------
+def _template_exists(key: str, template_dir: str = TEMPLATE_DIR) -> bool:  # [ADDED]
+    return os.path.isfile(os.path.join(template_dir, f"{key}.j2"))
+
+
+def render_model_source(
+    model_key: str, spec: Dict[str, Any], template_dir: str = TEMPLATE_DIR
+) -> str:
+    """
+    주어진 model_key에 해당하는 템플릿(.j2)을 spec으로 렌더링하여 .py 소스 문자열을 돌려준다.
+    - Jinja for문은 템플릿에서 사용 금지
+    """
+    _harden_metrics(spec)
+    _ensure_dims(spec)  # [ADDED]
+
+    # [MODIFIED] alias 적용
+    template_key = _TEMPLATE_ALIAS.get(str(model_key).lower(), str(model_key).lower())
+
+    env = _make_env(template_dir)
+    template_path = os.path.join(template_dir, f"{template_key}.j2")
+    if not os.path.isfile(template_path):
+        raise FileNotFoundError(f"Template not found: {template_path}")
+
+    with open(template_path, "r", encoding="utf-8") as f:
+        txt = f.read()
+    if re.search(r"{\%\s*for\s+", txt):
+        raise ValueError(
+            f"Template {model_key}.j2 contains a Jinja for-loop, which is forbidden. "
+            f"Use Python for-loops inside the template instead."
+        )
+
+    template = env.get_template(f"{template_key}.j2")
+    py_source: str = template.render(**spec)
+    py_source = _normalize_custom_slot_lines(py_source)
+    py_source = _sanitize_source(py_source)
+    return py_source
+
+
+def write_model_file(
+    model_key: str, spec: Dict[str, Any], out_dir: str = GENERATED_DIR
+) -> str:
+    """
+    렌더링 결과를 {out_dir}/{model_key}_generated.py 로 저장하고 파일 경로를 리턴
+    - [ADDED] 템플릿 미존재/비정상 라우팅 시 LLM 단독 생성 폴백
+    """
+    import os
+    import logging
+    from pathlib import Path
+
+    log = logging.getLogger(__name__)
+
+    # -----------------------------
+    # [ADDED] 위험 조합 감지 함수 (보강)
+    # -----------------------------
+    def _should_force_llm_fallback(_spec: Dict[str, Any], chosen_key: str) -> bool:
+        tlow = str((_spec or {}).get("title") or "").lower()
+        modality = (
+            str(
+                (_spec or {}).get("modality")
+                or (_spec or {}).get("data_modality")
+                or ""
+            )
+            .strip()
+            .lower()
+        )
+        pfam = str((_spec or {}).get("proposed_model_family") or "").strip().lower()
+        kw_blob = str((_spec or {}).get("kw_blob") or "")  # [ADDED]
+
+        image_translate_hint = any(
+            k in tlow or k in kw_blob.lower()
+            for k in ("image translation", "image-to-image", "style transfer")
+        )
+        diffusion_hint = any(
+            k in tlow or k in kw_blob.lower()
+            for k in ("diffusion", "ddpm", "score-based")
+        )
+
+        # 1) 이미지/멀티모달 + proposed=Other 이고 이미지 번역/디퓨전 단서가 있으면 폴백
+        if (
+            modality in {"image", "vision", "multimodal"}
+            and pfam in {"other", ""}
+            and (image_translate_hint or diffusion_hint)
+        ):
+            return True
+
+        # 2) Transformer/Transformer_MT로 찍혔는데 위 요건이면 회피
+        if (
+            str(chosen_key).lower() in {"transformer", "transformer_mt"}
+            and modality in {"image", "vision", "multimodal"}
+            and (image_translate_hint or diffusion_hint)
+        ):
+            return True
+
+        # 3) [ADDED] proposed=Other/빈값 + '가족 힌트 없음' → 무조건 LLM 폴백
+        #    (라우팅이 과제/모달리티만으로 resnet 등으로 새는 현상 차단)
+        try:
+            # routing의 힌트 탐지/매핑을 재사용(있으면)
+            from services.routing import _detect_family_hints, _template_family, _detect_strong_family_hints  # type: ignore
+
+            # hints = _detect_family_hints(kw_blob)
+            hints = _detect_strong_family_hints(kw_blob)
+            tmpl_fam = _template_family(str(chosen_key))
+        except Exception:
+            # 안전 폴백(간단 판별)
+            s = kw_blob.lower()
+            hints = set()
+            if any(k in s for k in ("transformer", "self-attention", "multi-head")):
+                hints.add("transformer")
+            if any(k in s for k in ("cnn", "convolution", "resnet", "vgg", "densenet")):
+                hints.add("cnn")
+            if any(k in s for k in ("vit", "swin")):
+                hints.add("vit")
+            tmpl = str(chosen_key).lower()
+            if tmpl in {"transformer", "transformer_mt"}:
+                tmpl_fam = "transformer"
+            elif tmpl in {"resnet", "cnn", "cnn_family"}:
+                tmpl_fam = "cnn"
+            elif tmpl in {"vit", "swin"}:
+                tmpl_fam = "vit"
+            else:
+                tmpl_fam = ""
+
+        # 3-a) family 힌트 자체가 없으면 LLM 폴백
+        if pfam in {"other", ""} and not hints:
+            return True
+
+        # 3-b) 힌트는 있는데, 라우팅 템플릿의 family와 불일치하면 LLM 폴백
+        if pfam in {"other", ""} and tmpl_fam and (tmpl_fam not in hints):
+            return True
+
+        return False
+
+    # 템플릿 키 정규화 (alias 처리)
+    original_key = str(model_key).strip()
+    forced_by_key = ("llm" in original_key.lower()) or ("풀백" in original_key.lower())
+
+    chosen_template_key = _TEMPLATE_ALIAS.get(
+        str(model_key).lower(), str(model_key).lower()
+    )
+
+    # 안전한 out_dir
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    out_path = os.path.join(out_dir, f"{model_key}_generated.py")
+
+    # -----------------------------
+    # 0) 강제 LLM 폴백 조건 체크 (렌더 시도 전에)
+    # -----------------------------
+    force_llm = forced_by_key or _should_force_llm_fallback(
+        spec or {}, chosen_template_key
+    )
+
+    source: str
+    source_mode = "template"
+
+    if force_llm:
+        # === LLM 폴백 경로 (강제) ===
+        source_mode = "llm_fallback"
+        py_src = None
+        try:
+            from services.llm_codegen_assist import generate_basecode_fallback
+
+            out = generate_basecode_fallback(spec or {})
+            py_src = (out or {}).get("py_src")
+        except Exception as ee:
+            log.warning("LLM fallback function unavailable or failed: %s", ee)
+
+        if not isinstance(py_src, str) or not py_src.strip():
+            # 마지막 보호막: 미니멀 스텁
+            opt_name = str((spec or {}).get("optimizer_name") or "adam")
+            loss_name = str(
+                (spec or {}).get("loss") or "sparse_categorical_crossentropy"
+            )
+            mets = (spec or {}).get("metrics") or ["accuracy"]
+            if not isinstance(mets, list):
+                mets = [str(mets)]
+            mets_repr = "[" + ", ".join(repr(str(m)) for m in mets) + "]"
+            py_src = f"""# -*- coding: utf-8 -*-
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+import random, numpy as np
+
+# seeding
+seed = int(globals().get("seed", 42))
+random.seed(seed); np.random.seed(seed); tf.random.set_seed(seed)
+
+def build_model():
+    # minimal encoder-only example
+    inputs = keras.Input(shape=(128, 8))
+    x = layers.Dense(64, activation='relu')(inputs)
+    outputs = layers.Dense(2, activation='softmax')(x)
+    model = keras.Model(inputs, outputs)
+
+    # compile-align variables (spec-aligned or defaults)
+    optimizer = keras.optimizers.get({opt_name!r})
+    loss_fn = {loss_name!r}
+    metrics = {mets_repr}
+
+    # standard compile signature (analyzer-friendly)
+    model.compile(optimizer=optimizer, loss=loss_fn, metrics=metrics)
+    return model
+""".rstrip()
+        source = py_src
+
+    else:
+        # -----------------------------
+        # 1) 템플릿 렌더 시도
+        # -----------------------------
+        try:
+            source = render_model_source(chosen_template_key, spec)
+        except FileNotFoundError:
+            # === 템플릿 없음 → LLM 폴백 경로 ===
+            log.warning(
+                "write_model_file: template '%s' not found. switching to LLM fallback.",
+                chosen_template_key,
+            )
+            source_mode = "llm_fallback"
+            py_src = None
+            try:
+                from services.llm_codegen_assist import generate_basecode_fallback
+
+                out = generate_basecode_fallback(spec or {})
+                py_src = (out or {}).get("py_src")
+            except Exception as ee:
+                log.warning("LLM fallback function unavailable or failed: %s", ee)
+
+            if not isinstance(py_src, str) or not py_src.strip():
+                # 마지막 보호막: 미니멀 스텁
+                opt_name = str((spec or {}).get("optimizer_name") or "adam")
+                loss_name = str(
+                    (spec or {}).get("loss") or "sparse_categorical_crossentropy"
+                )
+                mets = (spec or {}).get("metrics") or ["accuracy"]
+                if not isinstance(mets, list):
+                    mets = [str(mets)]
+                mets_repr = "[" + ", ".join(repr(str(m)) for m in mets) + "]"
+                py_src = f"""# -*- coding: utf-8 -*-
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+import random, numpy as np
+
+# seeding
+seed = int(globals().get("seed", 42))
+random.seed(seed); np.random.seed(seed); tf.random.set_seed(seed)
+
+def build_model():
+    # minimal encoder-only example
+    inputs = keras.Input(shape=(128, 8))
+    x = layers.Dense(64, activation='relu')(inputs)
+    outputs = layers.Dense(2, activation='softmax')(x)
+    model = keras.Model(inputs, outputs)
+
+    # compile-align variables (spec-aligned or defaults)
+    optimizer = keras.optimizers.get({opt_name!r})
+    loss_fn = {loss_name!r}
+    metrics = {mets_repr}
+
+    # standard compile signature (analyzer-friendly)
+    model.compile(optimizer=optimizer, loss=loss_fn, metrics=metrics)
+    return model
+""".rstrip()
+            source = py_src
+
+    # ----------------------------------------------------
+    # ENV 플래그로 LLM 슬롯치환 명시적 제어
+    # ----------------------------------------------------
+    use_llm = str(os.getenv("USE_LLM_ASSIST", "false")).lower() in ("1", "true", "yes")
+
+    before = source
+    filled = source  # 기본: no-op
+    if source_mode == "template" and use_llm:
+        # 템플릿 기반일 때만 슬롯치환 시도 (LLM 폴백 소스는 완성 코드이므로 불필요)
+        try:
+            filled = _fill_custom_blocks(source, spec)  # 슬롯 없으면 원본 그대로
+        except Exception as e:
+            print(f"[llm-assist] slot fill failed: {e}")
+            filled = source
+
+    if filled != before:
+        print(f"[llm-assist] custom blocks filled (template={chosen_template_key})")
+
+    # 정리/검사로 진행
+    source = filled
+
+    # 헤더에 모드 기록
+    header = f"# [info] source_mode={source_mode} template_key={chosen_template_key}\n"
+    if not source.startswith("#"):
+        source = header + source
+    else:
+        source = header + source
+
+    # PRE-IMPORT GUARD & 불필요한 펜스 제거 등
+    source = _sanitize_source(source)
+    source = _comment_out_exec_before_first_import(source)
+
+    _preflight_check_source(
+        source,
+        fname=(
+            f"{chosen_template_key}.j2(expanded)"
+            if source_mode == "template"
+            else "llm_fallback"
+        ),
+    )
+
+    # 6) 파일 저장 (아토믹)
+    print(
+        f"[codegen] template={chosen_template_key} mode={source_mode} -> out={os.path.basename(out_path)}"
+    )
+    import tempfile, os
+
+    dir_name = os.path.dirname(out_path)
+    os.makedirs(dir_name, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_codegen_", dir=dir_name, text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(source)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, out_path)  # atomic on POSIX
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+    return out_path
+
+
+# ---------------------------
+# 4) 동적 import & 빌드
+# ---------------------------
+def import_module_from_path(py_path: str, module_name: str = None) -> ModuleType:
+    if module_name is None:
+        base = os.path.basename(py_path)
+        module_name = os.path.splitext(base)[0]
+    spec = importlib.util.spec_from_file_location(module_name, py_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot import module from {py_path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def build_compiled_model(model_key: str, spec: Dict[str, Any]) -> Any:
+    """
+    1) 템플릿 렌더링→.py 저장
+    2) 모듈 import
+    3) build_model() 호출 → compile된 keras.Model 반환
+    """
+    py_path = write_model_file(model_key, spec)
+    # RAW 헤더 감지 시(LLM 원본), 컴파일을 시도하지 않음 (상위에서 처리 권장)
+    try:
+        _txt = open(py_path, "r", encoding="utf-8").read()
+        if "source_mode=llm_raw" in _txt:
+            return None
+    except Exception:
+        pass
+    try:
+        mod = import_module_from_path(py_path)
+        if not hasattr(mod, "build_model"):
+            raise AttributeError(f"{py_path} 에 build_model() 함수가 없습니다.")
+        model = mod.build_model()
+        return model
+    except Exception as e:
+        # [ADDED] LLM 리페어 제안 (자동 적용 없음, 로그만 출력)
+        if "_LLM_OK" in globals() and _LLM_OK:
+            try:
+                from services import llm_codegen_assist as lga
+
+                with open(py_path, "r", encoding="utf-8") as f:
+                    excerpt = f.read()[:4000]
+                advice = lga.advise_repair(str(e), spec, excerpt)
+                print("[LLM-REPAIR] reasons:", getattr(advice, "reasons", None))
+                for d in getattr(advice, "diffs", []) or []:
+                    print("[LLM-REPAIR] diff:", d)
+                for c in getattr(advice, "code_snippets", []) or []:
+                    print("[LLM-REPAIR] snippet:\n", c)
+            except Exception:
+                pass
+        raise
+
+
+def _comment_out_exec_before_first_import(text: str) -> str:
+    """
+    Pre-import guard:
+    - 허용: shebang/encoding, 모듈 docstring, 빈 줄, 주석, CUSTOM_BLOCK 마커
+    - 금지: 첫 'import'/'from' 이전의 모든 실행문 → 자동 주석화
+      (예: 'x = keras.layers.StochasticDepth(...)' 같은 라인)
+    """
+    lines = text.splitlines(True)
+    out = []
+    i = 0
+    n = len(lines)
+
+    # shebang/encoding 패스
+    while i < n and (lines[i].startswith("#!") or "coding" in lines[i]):
+        out.append(lines[i])
+        i += 1
+
+    # 모듈 docstring 허용 (triple quotes)
+    if i < n and lines[i].lstrip().startswith(('"""', "'''")):
+        quote = '"""' if '"""' in lines[i] else "'''"
+        out.append(lines[i])
+        i += 1
+        while i < n and quote not in lines[i]:
+            out.append(lines[i])
+            i += 1
+        if i < n:
+            out.append(lines[i])
+            i += 1
+
+    # 첫 import 전 구간 처리
+    while i < n:
+        ln = lines[i]
+        stripped = ln.lstrip()
+        if stripped.startswith("import ") or stripped.startswith("from "):
+            out.append(ln)
+            i += 1
+            break
+        if (not stripped) or stripped.startswith("#") or "CUSTOM_BLOCK:" in ln:
+            out.append(ln)  # 빈 줄/주석/마커 허용
+        else:
+            out.append("# [auto-commented pre-import] " + ln)  # 실행문은 주석화
+        i += 1
+
+    # 나머지 그대로
+    while i < n:
+        out.append(lines[i])
+        i += 1
+
+    return "".join(out)
+
+
+# === BEGIN: CUSTOM_BLOCK injector & postprocess ===
+import re as _re
+
+_SLOT_LINE = _re.compile(
+    r"^(?P<indent>\s*)\#\s*"
+    r"(?:\{\%\s*raw\s*\%\}\s*)?"
+    r"\{\{?\s*CUSTOM_BLOCK:(?P<slot>[^}\s]+)\s*\}\}?"
+    r"(?:\s*\{\%\s*endraw\s*\%\})?"
+    r"(?:\s*\#.*)?$",
+    _re.MULTILINE,
+)
+
+
+def _inject_custom_blocks(rendered_text: str, custom_blocks: dict) -> str:
+    if not isinstance(rendered_text, str):
+        return rendered_text
+    cb = custom_blocks or {}
+
+    def _repl(m: "_re.Match[str]") -> str:
+        indent = m.group("indent") or ""
+        slot = (m.group("slot") or "").strip()
+        code = cb.get(slot, "")
+        if not code:
+            return m.group(0)
+        lines = [indent + ln for ln in str(code).splitlines()]
+        return "\n".join(lines)
+
+    return _SLOT_LINE.sub(_repl, rendered_text)
+
+
+def _to_dict(obj):
+    if isinstance(obj, dict):
+        return obj
+    # pydantic-like
+    if hasattr(obj, "dict"):
+        try:
+            return obj.dict()
+        except Exception:
+            pass
+    return {}
+
+
+def _postprocess_rendered(_text: str, _locals: dict):
+    sp = _locals.get("spec") or _locals.get("model_spec") or _locals.get("ctx") or {}
+    sp = _to_dict(sp)
+    fam = ""
+    try:
+        fam = (sp.get("family") or _locals.get("template_key") or "").lower()
+    except Exception:
+        fam = (_locals.get("template_key") or "").lower()
+
+    try:
+        sp2 = autofill_custom_blocks(sp, family=fam)
+    except Exception:
+        sp2 = sp
+
+    cb = (sp2 or {}).get("custom_blocks", {})
+    try:
+        return _inject_custom_blocks(_text, cb)
+    except Exception:
+        return _text
+
+
+# === END: CUSTOM_BLOCK injector & postprocess ===
+
+
+# --- AUTO-ADDED: slot-aware rendering helper (non-breaking) ---
+def render_and_fill_slots(
+    tmpl_path_or_text: str, spec: dict, filename: str = None
+) -> str:
+    import os
+
+    if os.path.exists(tmpl_path_or_text):
+        with open(tmpl_path_or_text, encoding="utf-8") as f:
+            template_text = f.read()
+        fname = filename or tmpl_path_or_text
+    else:
+        template_text = tmpl_path_or_text
+        fname = filename or "template.py"
+    payloads = resolve_payloads_for_template(spec, template_text, fname)
+    return apply_custom_blocks(template_text, payloads)

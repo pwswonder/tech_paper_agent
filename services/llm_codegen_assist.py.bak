@@ -1,0 +1,1173 @@
+# services/llm_codegen_assist.py
+# 목적: Base code 생성 파이프라인에서 LLM을 "보조"로 활용하기 위한 유틸
+# - 템플릿 추천, spec 보강, 커스텀 블록 합성, 에러 리페어 제안 등
+# - 모든 출력은 JSON 스키마 검증 후에만 적용
+
+from __future__ import annotations
+from typing import Dict, Any, List, Optional
+import json
+import re
+import textwrap
+import logging
+
+# (당신 환경에서 쓰는 LLM 클라이언트 선택)
+# Azure OpenAI (예시)
+from langchain_openai import AzureChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+from pydantic import BaseModel, Field, ValidationError
+
+# --- 환경 준비 (맥OS/애플실리콘 M4에서도 문제 없음) ---
+# .env에 AOAI 관련 값이 있다면 기존 방식 재사용
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+log = logging.getLogger(__name__)
+
+
+# =========================================================
+# Azure OpenAI 전용 LLM 헬퍼 (간단/안정)
+# =========================================================
+def _get_llm():
+    """
+    AzureChatOpenAI 인스턴스를 ENV에서 생성해 반환합니다.
+    필수 ENV:
+      - AOAI_API_KEY
+      - AOAI_ENDPOINT
+      - AOAI_DEPLOY_GPT41  (배포명)
+    선택 ENV:
+      - AOAI_API_VERSION (기본: 2024-10-21)
+      - LLM_TEMPERATURE  (기본: 0.0)
+    """
+    api_key = (os.getenv("AOAI_API_KEY") or "").strip()
+    endpoint = (os.getenv("AOAI_ENDPOINT") or "").strip()
+    deployment = (os.getenv("AOAI_DEPLOY_GPT41") or "").strip()
+    api_version = (os.getenv("AOAI_API_VERSION") or "2024-10-21").strip()
+    temperature = float(os.getenv("LLM_TEMPERATURE", "0.0"))
+
+    if not (api_key and endpoint and deployment):
+        log.warning(
+            "Azure LLM 설정 누락: AOAI_API_KEY/AOAI_ENDPOINT/AOAI_DEPLOY_GPT41 필요. "
+            "폴백 스텁 코드가 사용될 수 있습니다."
+        )
+        return None
+
+    # LangChain AzureChatOpenAI (langchain_openai>=0.1.0)
+    return AzureChatOpenAI(
+        azure_deployment=deployment,
+        openai_api_version=api_version,
+        api_key=api_key,
+        azure_endpoint=endpoint,
+        temperature=temperature,
+    )
+
+
+def _call_llm(system: str, user: str) -> str:
+    """
+    - system/user 메시지로 LCEL 체인 구성하여 문자열을 반환
+    - 예외/미설정 시 빈 문자열 반환 (상위에서 스텁 처리)
+    """
+    try:
+        llm = _get_llm()
+        if llm is None:
+            return ""
+
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", "{system}"),
+                ("user", "{user}"),
+            ]
+        )
+        chain = prompt | llm | StrOutputParser()
+
+        text = chain.invoke({"system": system, "user": user})
+        return text if isinstance(text, str) else str(text)
+    except Exception as e:
+        log.warning("Azure LLM 호출 실패: %s", e)
+        return ""
+
+
+# ---------- 스키마 정의 ----------
+class TemplateAdvice(BaseModel):
+    recommended_key: str = Field(
+        ..., description="예: 'transformer', 'cnn', 'rnn_lstm'"
+    )
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    reasons: List[str] = Field(default_factory=list)
+
+
+class SpecPatch(BaseModel):
+    # 누락값 보강용: spec의 dims/학습옵션 등 보완 키-값
+    patch: Dict[str, Any] = Field(default_factory=dict)
+    reasons: List[str] = Field(default_factory=list)
+
+
+class BlockSynthesis(BaseModel):
+    slot_name: str
+    code: str  # 안전 가드로 필터링/검사 후 사용
+    notes: Optional[str] = None
+
+
+class RepairAdvice(BaseModel):
+    diffs: List[str] = Field(
+        default_factory=list
+    )  # "PATCH: path::line -> 변경내용" 같은 요약
+    code_snippets: List[str] = Field(default_factory=list)
+    reasons: List[str] = Field(default_factory=list)
+
+
+# ---------- 프롬프트 ----------
+_template_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a senior ML engineer. Suggest best template key for reproducing the model from spec and evidence.",
+        ),
+        ("user", "SPEC (JSON):\n{spec_json}\n\nEVIDENCE SNIPPETS:\n{evidence}"),
+    ]
+)
+
+_spec_patch_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a meticulous research engineer. Propose only missing or unsafe defaults for the spec.",
+        ),
+        (
+            "user",
+            "CURRENT SPEC:\n{spec_json}\n\nKNOWN EVIDENCE:\n{evidence}\n\nReturn only keys to add or fix.",
+        ),
+    ]
+)
+
+_block_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "Generate a minimal Python Keras code block for this slot. No imports, just the block.",
+        ),
+        ("user", "SLOT: {slot}\nCONTEXT SPEC:\n{spec_json}\nNOTES: {notes}"),
+    ]
+)
+
+_repair_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a code-repair assistant. Suggest minimal changes to fix the error. Respond with diffs and short code snippets.",
+        ),
+        (
+            "user",
+            "ERROR LOG:\n{err}\n\nCURRENT SPEC:\n{spec_json}\n\nSOURCE CONTEXT (TRUNCATED):\n{source_excerpt}",
+        ),
+    ]
+)
+# ======================================================================
+# [ADDED] LLM-only basecode fallback synthesizer
+# - 템플릿이 없을 때, spec만으로 완전한 base code를 합성
+# - 반환: (py_src: str, summary: dict)
+# ======================================================================
+
+
+# === [UPDATED] 기존 함수: Azure 호출 + 안전 폴백 ==========================
+# ===========================================
+# [ADDED/REPLACED] LLM 폴백(하드닝 파이프라인 포함)
+# ===========================================
+def generate_basecode_fallback(
+    spec: Dict[str, Any], mode: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    LLM 단독으로 베이스코드 생성.
+    반환: {"py_src": <str>, "summary": {...}}
+    - 반드시 build_model() 포함
+    - model.compile(optimizer=optimizer, loss=loss_fn, metrics=metrics) 서명 사용
+    - optimizer/loss_fn/metrics 변수를 사전에 정의(compile-align)
+    - 시드 설정 포함
+    - KerasTensor-unsafe tf.* 호출들을 레이어/keras.ops로 감쌈(그래프 안전)
+    """
+    import json, re, textwrap, logging, os
+
+    log = logging.getLogger(__name__)
+
+    # -- mode 결정 (spec > env > 기본)
+    if mode is None:
+        mode = str(
+            spec.get("hardening_mode") or os.getenv("BASECODE_MODE") or "semantic_lite"
+        )
+    mode = mode.lower().strip()
+
+    # -- 0) compile 변수 기본값
+    opt_name = str(spec.get("optimizer_name") or "adam")
+    loss_name = str(spec.get("loss") or "sparse_categorical_crossentropy")
+    mets = spec.get("metrics") or ["accuracy"]
+    if not isinstance(mets, list):
+        mets = [str(mets)]
+    mets_repr = "[" + ", ".join(repr(str(m)) for m in mets) + "]"
+    spec_json = json.dumps(spec, ensure_ascii=False, indent=2)
+
+    # -- 1) 프롬프트
+    CONCAT_RULES = """
+    - Concatenation MUST be along the channel axis only: use `layers.Concatenate(axis=-1)`.
+    - BEFORE concatenation, align non-concat dims:
+      * 4D (B,H,W,C): use `layers.Resizing(H,W, interpolation="bilinear")` with dynamic shapes.
+      * 3D (B,L,C): crop all to the MIN L by slicing (no numpy over symbolic shapes).
+    - NEVER use numpy over symbolic shapes (no `np.sqrt(x.shape[1])`).
+    - Avoid keras.applications (no external weights).
+    """
+    system = (
+        "You are a senior ML engineer. Generate a single Python file that builds a compiled Keras model.\n"
+        "Hard rules:\n"
+        "- Define `def build_model():` returning a compiled keras.Model\n"
+        "- Use variables exactly: optimizer, loss_fn, metrics for model.compile\n"
+        "- Deterministic seeds (random/numpy/tf) via global `seed` (default 42)\n"
+        "- Do NOT call raw tf.* ops on KerasTensors directly; wrap them in Keras Layers or use keras.ops.\n"
+        "- No training loop / no dataset I/O; imports limited to tf/keras/numpy/random.\n"
+        "- Must compile on Python 3.10+ / TF 2.x / Keras 3."
+        "\n\n" + CONCAT_RULES
+    )
+    user = textwrap.dedent(
+        f"""
+    [SPEC JSON]
+    ```json
+    {spec_json}
+    ```
+
+    [HARD CONSTRAINTS]
+    - Provide a single Python module (no extra text).
+    - Must define: build_model() -> tf.keras.Model
+    - Define variables BEFORE compile:
+        optimizer = keras.optimizers.get({opt_name!r})
+        loss_fn = {loss_name!r}
+        metrics = {mets_repr}
+      Then call:
+        model.compile(optimizer=optimizer, loss=loss_fn, metrics=metrics)
+    - Add seeding snippet (random, numpy, tf) using global 'seed' with default 42.
+    - Keep code minimal & readable.
+    """
+    ).strip()
+
+    # -- 2) LLM 호출
+    text = _call_llm(system, user).strip()
+
+    # -- RAW 모드: LLM 원본 그대로 반환
+    if mode == "raw":
+        code = text
+        header = "# [info] source_mode=llm_raw\n" "# [info] hardening=off\n"
+        return {
+            "py_src": header + code,
+            "summary": {"mode": "llm_fallback:raw", "len": len(code), "hints": []},
+        }
+
+    # -- 3) 실패 시 스텁
+    if not text:
+        code_stub = textwrap.dedent(
+            f"""
+            # -*- coding: utf-8 -*-
+            import tensorflow as tf
+            from tensorflow import keras
+            from tensorflow.keras import layers
+            import random, numpy as np
+            seed = int(globals().get("seed", 42))
+            random.seed(seed); np.random.seed(seed); tf.random.set_seed(seed)
+
+            def build_model():
+                inputs = keras.Input(shape=(128, 8))
+                x = layers.Dense(64, activation='relu')(inputs)
+                outputs = layers.Dense(2, activation='softmax')(x)
+                model = keras.Model(inputs, outputs)
+                optimizer = keras.optimizers.get({opt_name!r})
+                loss_fn = {loss_name!r}
+                metrics = {mets_repr}
+                model.compile(optimizer=optimizer, loss=loss_fn, metrics=metrics)
+                return model
+        """
+        ).strip()
+        return {
+            "py_src": code_stub,
+            "summary": {"mode": "stub", "len": len(code_stub), "hints": ["llm_empty"]},
+        }
+
+    # -- 4) 코드 추출/정리
+    code = text
+    if "```" in code:
+        m = re.search(r"```(?:python)?\s*(.*?)\s*```", code, flags=re.S | re.I)
+        if m:
+            code = m.group(1).strip()
+    code = re.sub(r"^\s*![^\n]*$", "", code, flags=re.M)  # shell magics 제거
+    code = re.sub(r"^\s*%[^\n]*$", "", code, flags=re.M)  # jupyter magics 제거
+
+    # ========= 5) 하드닝 유틸/헬퍼들(문자열 패치로 주입) =========
+    TF_GENERIC_LAYER = r"""
+# [TF_GENERIC_LAYER_BEGIN]
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+def _resolve_tf_fn(path: str):
+    obj = tf
+    for p in path.split("."):
+        obj = getattr(obj, p)
+    return obj
+
+class TfCallLayer(layers.Layer):
+    '''
+    Wrap an arbitrary tf.* call so it runs inside Keras Layer call().
+    - fn_path: e.g., "image.extract_patches" or "roll"
+    - static_args/static_kwargs: non-tensor arguments captured at build time
+    '''
+    def __init__(self, fn_path: str, *static_args, **static_kwargs):
+        super().__init__()
+        self.fn_path = str(fn_path)
+        self.static_args = static_args
+        self.static_kwargs = static_kwargs
+
+    def call(self, inputs):
+        if isinstance(inputs, (list, tuple)): dyn_args = list(inputs)
+        else:                                 dyn_args = [inputs]
+        fn = _resolve_tf_fn(self.fn_path)
+        return fn(*dyn_args, *self.static_args, **self.static_kwargs)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"fn_path": self.fn_path,
+                    "static_args": list(self.static_args),
+                    "static_kwargs": dict(self.static_kwargs)})
+        return cfg
+# [TF_GENERIC_LAYER_END]
+""".strip()
+
+    REPEAT_TILE_HELPER = r"""
+# [REPEAT_TILE_HELPER_BEGIN]
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+def safe_repeat(x, repeats, axis=0):
+    K = keras.ops
+    r = K.cast(repeats, "int32")
+    return K.repeat(x, r, axis=axis)
+
+def safe_tile(x, multiples):
+    K = keras.ops
+    m = K.convert_to_tensor(multiples, dtype="int32")
+    return K.tile(x, m)
+
+class SafeRepeat(layers.Layer):
+    def __init__(self, axis=0, **kwargs):
+        super().__init__(**kwargs); self.axis = int(axis)
+    def call(self, inputs):
+        x, repeats = inputs
+        K = keras.ops
+        r = K.cast(repeats, "int32")
+        return K.repeat(x, r, axis=self.axis)
+    def get_config(self): return {"axis": self.axis}
+
+class SafeTile(layers.Layer):
+    def call(self, inputs):
+        x, multiples = inputs
+        K = keras.ops
+        m = K.cast(multiples, "int32")
+        return K.tile(x, m)
+# [REPEAT_TILE_HELPER_END]
+""".strip()
+
+    EXTRACT_HELPER_EXAMPLE = r"""
+# [EXTRACT_HELPER_BEGIN]
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+class ExtractPatches(layers.Layer):
+    def __init__(self, size=3, stride=1, rate=1, padding="SAME", **kwargs):
+        super().__init__(**kwargs)
+        self.size=int(size); self.stride=int(stride); self.rate=int(rate)
+        self.padding=str(padding).upper()
+    def call(self, images):
+        return tf.image.extract_patches(
+            images=images,
+            sizes=[1,self.size,self.size,1],
+            strides=[1,self.stride,self.stride,1],
+            rates=[1,self.rate,self.rate,1],
+            padding=self.padding,
+        )
+    def get_config(self):
+        return {"size":self.size,"stride":self.stride,"rate":self.rate,"padding":self.padding}
+
+def extract_patches_layer(x, patch_size=3, stride=1, rate=1, padding="SAME"):
+    return ExtractPatches(size=patch_size, stride=stride, rate=rate, padding=padding)(x)
+# [EXTRACT_HELPER_END]
+""".strip()
+
+    ROLL_HELPER_EXAMPLE = r"""
+# [ROLL_HELPER_BEGIN]
+import tensorflow as tf
+from tensorflow import keras
+def safe_roll(x, shift=1, axis=1):
+    return TfCallLayer("roll", shift=shift, axis=axis)(x)
+# [ROLL_HELPER_END]
+""".strip()
+
+    SWIN_COMPAT_CLASS = r"""
+# [SWIN_COMPAT_BEGIN]
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+class SimpleSwinBlock(layers.Layer):
+    def __init__(self, dim=64, num_heads=4, window_size=8, shift_size=0, **kwargs):
+        super().__init__(**kwargs)
+        self.dim=int(dim); self.num_heads=int(num_heads)
+        self.window_size=int(window_size); self.shift_size=int(shift_size)
+        self.norm = layers.LayerNormalization(epsilon=1e-5)
+        self.dwconv = layers.DepthwiseConv2D(3, padding="same")
+        self.pw1 = layers.Conv2D(self.dim*2, 1, padding="same")
+        self.act = layers.Activation("gelu")
+        self.pw2 = layers.Conv2D(self.dim, 1, padding="same")
+    def call(self, x):
+        y = self.norm(x); y = self.dwconv(y); y = self.pw1(y); y = self.act(y); y = self.pw2(y)
+        return x + y
+# [SWIN_COMPAT_END]
+""".strip()
+
+    SWIN_SAFE_HELPERS = r"""
+# [SWIN_SAFE_HELPERS_BEGIN]
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+def safe_window_partition(x, window_size):
+    K = keras.ops; win = int(window_size)
+    B = K.shape(x)[0]; H = K.shape(x)[1]; W = K.shape(x)[2]; C = K.shape(x)[3]
+    pad_h = K.mod(win - K.mod(H, win), win)
+    pad_w = K.mod(win - K.mod(W, win), win)
+    paddings = tf.stack([[0,0],[0,pad_h],[0,pad_w],[0,0]], axis=0)
+    x_pad = tf.pad(x, paddings)
+    Hp = K.shape(x_pad)[1]; Wp = K.shape(x_pad)[2]
+    nh = tf.math.floordiv(Hp, win); nw = tf.math.floordiv(Wp, win)
+    x_reshaped = K.reshape(x_pad, (B, nh, win, nw, win, C))
+    x_perm = K.transpose(x_reshaped, (0,1,3,2,4,5))
+    windows = K.reshape(x_perm, (-1, win, win, C))
+    return windows, Hp, Wp
+
+def safe_window_reverse(windows, window_size, Hp, Wp, B):
+    K = keras.ops; win = int(window_size)
+    C = K.shape(windows)[-1]
+    nh = tf.math.floordiv(Hp, win); nw = tf.math.floordiv(Wp, win)
+    x = K.reshape(windows, (B, nh, nw, win, win, C))
+    x = K.transpose(x, (0,1,3,2,4,5))
+    x = K.reshape(x, (B, Hp, Wp, C))
+    return x
+# [SWIN_SAFE_HELPERS_END]
+""".strip()
+
+    # -- 6) 하드닝 도우미
+    def _safe_insert_after_imports(src: str, patch: str) -> str:
+        """
+        [핵심 수정]
+        - 더 이상 'import 다음'에 넣지 않고, **파일 최상단**에 넣되
+        shebang(#!) / encoding 헤더(# -*- coding: ... *-/) 뒤에만 안전하게 삽입.
+        - textwrap.dedent + 좌우 공백 정리로 들여쓰기 비정상화를 원천 차단.
+        - 이렇게 하면 LLM이 함수 내부에 import를 썼어도, 함수 내부에 끼어드는 일이 없다.
+        """
+        import re, textwrap
+
+        s = src.replace("\r\n", "\n")
+        p = textwrap.dedent(patch).lstrip("\n")
+        if not p.endswith("\n"):
+            p += "\n"
+        p += "\n"  # 패치 뒤에 공백 라인 하나
+
+        lines = s.splitlines()
+
+        insert_idx = 0
+        # 1) shebang 유지
+        if insert_idx < len(lines) and lines[0].startswith("#!"):
+            insert_idx = 1
+
+        # 2) encoding 헤더는 파일 상단 1~2라인에만 허용되므로 그 뒤로 삽입
+        coding_re = re.compile(r"^\s*#.*coding[:=]\s*[-\w.]+")
+        if insert_idx < len(lines) and coding_re.match(lines[insert_idx] or ""):
+            insert_idx += 1
+        elif len(lines) >= 2 and coding_re.match(lines[1] or ""):
+            insert_idx = 2
+
+        # 3) 최종 삽입
+        lines.insert(insert_idx, p.rstrip("\n"))
+        out = "\n".join(lines)
+
+        # 4) 파일 선두에 의미 없는 들여쓰기 줄 제거 (모듈 레벨 'unexpected indent' 예방)
+        out = re.sub(r"^\s+\n", "\n", out, flags=re.M)
+
+        return out
+
+    def _inject_patch_grid(s: str) -> str:
+        s = re.sub(r"int\s*\(\s*np\.sqrt\s*\([^)]*\)\s*\)", "PATCH_GRID", s)
+        if "PATCH_GRID" not in s:
+            s = "PATCH_GRID = 16\n" + s
+        return s
+
+    def _ensure_tf_generic_layer(s: str) -> str:
+        return (
+            s
+            if "[TF_GENERIC_LAYER_BEGIN]" in s
+            else _safe_insert_after_imports(s, TF_GENERIC_LAYER)
+        )
+
+    def _ensure_extract_helper(s: str) -> str:
+        return (
+            s
+            if "[EXTRACT_HELPER_BEGIN]" in s
+            else _safe_insert_after_imports(s, EXTRACT_HELPER_EXAMPLE)
+        )
+
+    def _ensure_roll_helper(s: str) -> str:
+        return (
+            s
+            if "[ROLL_HELPER_BEGIN]" in s
+            else _safe_insert_after_imports(s, ROLL_HELPER_EXAMPLE)
+        )
+
+    def _ensure_repeat_tile_helper(s: str) -> str:
+        return (
+            s
+            if "[REPEAT_TILE_HELPER_BEGIN]" in s
+            else _safe_insert_after_imports(s, REPEAT_TILE_HELPER)
+        )
+
+    def _ensure_swin_helpers(s: str) -> str:
+        if "[SWIN_COMPAT_BEGIN]" not in s:
+            s = _safe_insert_after_imports(s, SWIN_COMPAT_CLASS)
+        if "[SWIN_SAFE_HELPERS_BEGIN]" not in s:
+            s = _safe_insert_after_imports(s, SWIN_SAFE_HELPERS)
+        return s
+
+    def _harden_seed_calls(s: str) -> str:
+        s = re.sub(
+            r"TfCallLayer\(\s*['\"]random\.set_seed['\"]\s*\)\s*\(\s*([^)]+)\s*\)",
+            r"tf.random.set_seed(\1)",
+            s,
+            flags=re.I,
+        )
+        s = re.sub(
+            r"TfCallLayer\(\s*['\"]keras\.utils\.set_random_seed['\"]\s*\)\s*\(\s*([^)]+)\s*\)",
+            r"tf.keras.utils.set_random_seed(\1)",
+            s,
+            flags=re.I,
+        )
+        return s
+
+    def _ast_wrap_tf_calls(src: str) -> str:
+        import ast
+
+        SPECIAL_PASSTHRU = {
+            ("tf", "random", "set_seed"),
+            ("tf", "keras", "utils", "set_random_seed"),
+        }
+        SPECIAL = {
+            ("tf", "image", "extract_patches"): "extract_patches_layer",
+            ("tf", "roll"): "safe_roll",
+            ("tf", "repeat"): "safe_repeat",
+            ("tf", "tile"): "safe_tile",
+        }
+
+        def is_tensor_like(node: ast.AST) -> bool:
+            return isinstance(node, (ast.Call, ast.Attribute, ast.Subscript, ast.Name))
+
+        class TfRewriter(ast.NodeTransformer):
+            def visit_Call(self, node: ast.Call):
+                self.generic_visit(node)
+                func = node.func
+                chain = []
+                cur = func
+                while isinstance(cur, ast.Attribute):
+                    chain.append(cur.attr)
+                    cur = cur.value
+                if isinstance(cur, ast.Name) and cur.id == "tf":
+                    chain.append(cur.id)
+                    full = list(reversed(chain))
+                    key = tuple(full)
+                    if key in SPECIAL_PASSTHRU:
+                        return node
+                    if key in SPECIAL:
+                        return ast.Call(
+                            func=ast.Name(id=SPECIAL[key], ctx=ast.Load()),
+                            args=node.args,
+                            keywords=node.keywords,
+                        )
+                    tensor_args, static_args, tensor_kwargs, static_kwargs = (
+                        [],
+                        [],
+                        [],
+                        [],
+                    )
+                    for a in node.args:
+                        (tensor_args if is_tensor_like(a) else static_args).append(a)
+                    for kw in node.keywords:
+                        (
+                            tensor_kwargs if is_tensor_like(kw.value) else static_kwargs
+                        ).append(kw)
+                    path_str = ".".join(full[1:])
+                    layer_ctor = ast.Call(
+                        func=ast.Name(id="TfCallLayer", ctx=ast.Load()),
+                        args=[ast.Constant(value=path_str)] + static_args,
+                        keywords=static_kwargs,
+                    )
+                    return ast.Call(
+                        func=layer_ctor,
+                        args=tensor_args if tensor_args else node.args,
+                        keywords=tensor_kwargs if tensor_kwargs else node.keywords,
+                    )
+                return node
+
+        try:
+            tree = ast.parse(src)
+            new_tree = TfRewriter().visit(tree)
+            ast.fix_missing_locations(new_tree)
+            return ast.unparse(new_tree)
+        except Exception:
+            return src
+
+    def _calc_default_feature_dims(spec: Dict[str, Any]) -> Dict[str, int]:
+        dims = (spec.get("dims") or {}) if isinstance(spec, dict) else {}
+        modality = str(spec.get("data_modality") or "").strip().lower()
+        out = {
+            "channels": int(dims.get("channels") or (3 if modality == "image" else 1)),
+            "features": int(
+                dims.get("num_features")
+                or dims.get("feature_dim")
+                or (32 if modality in {"text", "time_series", "sequence"} else 16)
+            ),
+        }
+        if out["channels"] <= 0:
+            out["channels"] = 3
+        if out["features"] <= 0:
+            out["features"] = 16
+        return out
+
+    def _inject_safe_input_and_dense(src: str, spec: Dict[str, Any]) -> str:
+        """
+        - 전역 치환을 **먼저** 수행: layers.Dense( → DenseSafeFn(
+        - 그 다음, 패치 블록을 삽입 (패치 블록 내부는 _RAW_DENSE 별칭으로 원래 Dense를 사용)
+        - 이렇게 하면 DenseSafe 내부의 base Dense가 다시 DenseSafe로 바뀌는 재귀를 방지
+        """
+        import re
+
+        # 0) 전역 치환을 먼저 수행 (패치 블록 삽입 전!)
+        s = re.sub(r"\blayers\.Dense\s*\(", "DenseSafeFn(", src)
+
+        # 1) 스펙 기반 기본 채널/피처 추정
+        cfg = _calc_default_feature_dims(spec)
+
+        # 2) f-string 대신 플레이스홀더로 안전하게 값 주입
+        patch = """
+    # [SAFE_INPUT_DENSE_BEGIN]
+    from tensorflow import keras
+    from tensorflow.keras import layers
+
+    _LLM_DEFAULT_CHANNELS = int(__CHAN__)
+    _LLM_DEFAULT_FEATURES = int(__FEAT__)
+
+    # keras.Input 몽키패치: 마지막 차원이 None이면 기본값으로 치환
+    _real_Input = keras.Input
+    def _safe_Input(*args, **kwargs):
+        shape = kwargs.get("shape", None)
+        if shape is None and args:
+            shape = args[0]
+        if isinstance(shape, tuple) and len(shape) >= 1:
+            lst = list(shape)
+            if lst[-1] is None:
+                # (H,W,C) 같은 3D 이미지 텐서면 채널, 그 외는 feature로 간주
+                if len(lst) == 3:
+                    lst[-1] = _LLM_DEFAULT_CHANNELS
+                else:
+                    lst[-1] = _LLM_DEFAULT_FEATURES
+                if "shape" in kwargs:
+                    kwargs["shape"] = tuple(lst)
+                else:
+                    args = (tuple(lst),) + tuple(args[1:])
+        return _real_Input(*args, **kwargs)
+    keras.Input = _safe_Input
+
+    # [중요] 전역 치환 대상에서 빼기 위한 원본 Dense 별칭
+    _RAW_DENSE = layers.Dense
+
+    # DenseSafe: Layer 키워드와 Dense 키워드 분리
+    class DenseSafe(layers.Layer):
+        def __init__(self, units, **dense_kwargs):
+            # Layer가 이해하는 키만 분리
+            layer_kwargs = {}
+            for k in ("name", "dtype", "trainable", "dynamic", "activity_regularizer"):
+                if k in dense_kwargs:
+                    layer_kwargs[k] = dense_kwargs.pop(k)
+            super().__init__(**layer_kwargs)
+
+            self.units = int(units)
+            # Dense에 전달할 나머지 인자(activation, 초기화/정규화 등)
+            self.dense_kwargs = dict(dense_kwargs)
+            # [핵심] 전역 치환에서 제외된 별칭으로 원본 Dense 생성
+            self.base_dense = _RAW_DENSE(self.units, **self.dense_kwargs)
+
+        def call(self, x):
+            # Keras 3: rank = len(x.shape)
+            rank = len(x.shape)
+            if rank == 4:
+                # (B,H,W,C) → GAP → Dense
+                x = layers.GlobalAveragePooling2D()(x)
+                return self.base_dense(x)
+            elif rank == 3:
+                # (B,L,C) → TimeDistributed(Dense)
+                return layers.TimeDistributed(_RAW_DENSE(self.units, **self.dense_kwargs))(x)
+            else:
+                # (B,C) 등 2D
+                return self.base_dense(x)
+
+    def DenseSafeFn(units, **kwargs):
+        return DenseSafe(units, **kwargs)
+    # [SAFE_INPUT_DENSE_END]
+    """.replace(
+            "__CHAN__", str(cfg["channels"])
+        ).replace(
+            "__FEAT__", str(cfg["features"])
+        )
+
+        # 3) import 블록 직후에 삽입 (shebang/encoding 뒤 상단에 안전 삽입)
+        s = _safe_insert_after_imports(s, patch)
+
+        return s
+
+    def _neutralize_and_inject_blocks(s: str) -> str:
+        s = re.sub(
+            r"^.*keras\.applications\..*$",
+            "# removed keras.applications import",
+            s,
+            flags=re.M,
+        )
+        s = re.sub(r"keras\.applications\.[A-Za-z0-9_\.]+", "layers.Conv2D", s)
+        return s
+
+    def _harden_static_shape_math(s: str) -> str:
+        s = re.sub(r"np\.sqrt\s*\([^)]*\)", "float(PATCH_GRID)", s)
+        s = re.sub(r"int\s*\(\s*np\.sqrt\s*\([^)]*\)\s*\)", "PATCH_GRID", s)
+        s = re.sub(r"\btf\.shape\s*\(", "keras.ops.shape(", s)
+        return s
+
+    def _harden_concat_and_numpy(s: str) -> str:
+        s = re.sub(r"layers\.Concatenate\s*\(\s*\)", "layers.Concatenate(axis=-1)", s)
+        s = re.sub(
+            r"layers\.Concatenate\s*\(\s*(?![^)]*axis\s*=)([^)]*)\)",
+            r"layers.Concatenate(axis=-1, \1)",
+            s,
+        )
+        s = re.sub(
+            r"layers\.Concatenate\s*\([^)]*\)\s*\(", "layers.Concatenate(axis=-1)(", s
+        )
+        return s
+
+    def _final_sanitize_layout(s: str) -> str:
+        return re.sub(r"\n{4,}", "\n\n\n", s)
+
+    # -- 7) 하드닝 파이프라인
+    code = _inject_patch_grid(code)
+    code = _ensure_tf_generic_layer(code)
+    code = _ast_wrap_tf_calls(code)
+    code = _harden_seed_calls(code)
+    code = _inject_safe_input_and_dense(code, spec)
+    code = _ensure_extract_helper(code)
+    code = _ensure_roll_helper(code)
+    code = _ensure_repeat_tile_helper(code)
+    code = _ensure_swin_helpers(code)
+    code = _neutralize_and_inject_blocks(code)
+    code = _harden_static_shape_math(code)
+    code = _harden_concat_and_numpy(code)
+    code = _final_sanitize_layout(code)
+
+    # -- 8) 컴파일 검증(문법)
+    try:
+        compile(code, "<llm_fallback_hardened>", "exec")
+        mode, hints = "llm", ["generated_without_template", "hardened"]
+    except Exception as e:
+        log.warning("하드닝 코드 compile 실패 → 스텁 폴백: %s", e)
+        code = textwrap.dedent(
+            f"""
+            # -*- coding: utf-8 -*-
+            import tensorflow as tf
+            from tensorflow import keras
+            from tensorflow.keras import layers
+            import random, numpy as np
+            seed = int(globals().get("seed", 42))
+            random.seed(seed); np.random.seed(seed); tf.random.set_seed(seed)
+
+            def build_model():
+                inputs = keras.Input(shape=(128, 8))
+                x = layers.Dense(64, activation='relu')(inputs)
+                outputs = layers.Dense(2, activation='softmax')(x)
+                model = keras.Model(inputs, outputs)
+                optimizer = keras.optimizers.get({opt_name!r})
+                loss_fn = {loss_name!r}
+                metrics = {mets_repr}
+                model.compile(optimizer=optimizer, loss=loss_fn, metrics=metrics)
+                return model
+        """
+        ).strip()
+        mode, hints = "stub", ["compile_error", str(e)]
+
+    return {
+        "py_src": code,
+        "summary": {"mode": f"llm_fallback:{mode}", "len": len(code), "hints": hints},
+    }
+
+
+# ---------- 함수들 ----------
+def advise_template_key(spec: Dict[str, Any], evidence: str) -> TemplateAdvice:
+    resp = _llm.invoke(
+        _template_prompt.format_messages(
+            spec_json=json.dumps(spec, ensure_ascii=False, indent=2),
+            evidence=evidence[:4000],
+        )
+    )
+    # 단순 JSON 추출 (모델에 JSON-only 응답 지시 가능)
+    try:
+        data = json.loads(resp.content)
+        return TemplateAdvice(**data)
+    except Exception:
+        # 실패 시 보수적으로 현재 family 기반 키 유지 제안
+        return TemplateAdvice(
+            recommended_key=spec.get("proposed_model_family", "").lower() or "mlp",
+            confidence=0.3,
+            reasons=["fallback"],
+        )
+
+
+def propose_spec_patch(spec: Dict[str, Any], evidence: str) -> SpecPatch:
+    resp = _llm.invoke(
+        _spec_patch_prompt.format_messages(
+            spec_json=json.dumps(spec, ensure_ascii=False, indent=2),
+            evidence=evidence[:4000],
+        )
+    )
+    try:
+        data = json.loads(resp.content)
+        return SpecPatch(**data)
+    except (json.JSONDecodeError, ValidationError):
+        return SpecPatch(patch={}, reasons=["no-change"])
+
+
+SAFE_PATTERN = re.compile(r"^(?!.*(os\.|sys\.|subprocess|open\().*)", re.DOTALL)
+
+
+def synthesize_block(
+    slot_name: str, spec: Dict[str, Any], notes: str = ""
+) -> BlockSynthesis:
+    resp = _llm.invoke(
+        _block_prompt.format_messages(
+            slot=slot_name,
+            spec_json=json.dumps(spec, ensure_ascii=False, indent=2),
+            notes=notes,
+        )
+    )
+    code = resp.content.strip()
+    # --- 안전 가드: 위험한 호출 차단 (간단 버전) ---
+    if not SAFE_PATTERN.match(code):
+        code = f"# BLOCK {slot_name} rejected by safety guard."
+    return BlockSynthesis(slot_name=slot_name, code=code, notes="auto-synthesized")
+
+
+def advise_repair(
+    err_log: str, spec: Dict[str, Any], source_excerpt: str = ""
+) -> RepairAdvice:
+    resp = _llm.invoke(
+        _repair_prompt.format_messages(
+            err=err_log[:4000],
+            spec_json=json.dumps(spec, ensure_ascii=False, indent=2),
+            source_excerpt=source_excerpt[:2000],
+        )
+    )
+    try:
+        data = json.loads(resp.content)
+        return RepairAdvice(**data)
+    except Exception:
+        return RepairAdvice(diffs=[], code_snippets=[], reasons=["fallback"])
+
+
+SLOT_RE = re.compile(r'''(?m)^\s*#\s*(?:\{\%\s*raw\s*\%\}\s*)?\{\{CUSTOM_BLOCK:([A-Za-z0-9_\-]+)\}\}(?:\s*\{\%\s*endraw\s*\%\})?\s*$''')
+
+
+    re.M,
+)
+
+
+def _indent_block(code: str, indent: str) -> str:
+    lines = code.splitlines(True)
+    out = []
+    for ln in lines:
+        out.append((indent + ln) if ln.strip() else ln)
+    return "".join(out)
+
+
+def apply_llm_slots(text: str, slot_payloads: dict) -> str:
+    # \"\"\"Replace CUSTOM_BLOCK slots with provided code, preserving indentation.
+    # Empty payload removes the slot line entirely.
+    # \"\"\"
+    def _repl(m):
+        indent, slot = m.group(1), m.group(2)
+        payload = slot_payloads.get(slot, "")
+        if not payload:
+            return ""
+        return _indent_block(payload.rstrip() + "\\n", indent)
+
+    return SLOT_RE.sub(_repl, text)
+
+
+# === [PATCH: BEGIN · LLM 산출물 하드닝 헬퍼] ==============================
+import re
+
+
+# ========== [HARDENING_ORCHESTRATOR_BEGIN] ==========
+from dataclasses import dataclass
+from typing import Callable, Optional, Literal, Set
+import re
+
+HardeningLevel = Literal["syntax_only", "semantic_lite", "aggressive"]
+
+
+@dataclass
+class HardeningPolicy:
+    level: HardeningLevel = "syntax_only"
+    allow: Optional[Set[str]] = None
+    deny: Optional[Set[str]] = None
+    verbose: bool = False
+
+
+@dataclass
+class Hardener:
+    name: str
+    predicate: Callable[[str, Optional[dict]], bool]
+    transform: Callable[[str, Optional[dict]], str]
+    min_level: HardeningLevel = "semantic_lite"
+
+
+def _pred_swin(code: str, spec: Optional[dict]) -> bool:
+    if re.search(r"\b(swin|swintransformer|swinv\d?)\b", code, re.I):
+        return True
+    if re.search(r"\b(SimpleSwinBlock|SwinBlock)\b", code):
+        return True
+    if re.search(r"\b(safe_)?window_(partition|reverse)\s*\(", code):
+        return True
+    if spec:
+        stack = [spec]
+        while stack:
+            v = stack.pop()
+            if isinstance(v, dict):
+                stack.extend(v.values())
+            elif isinstance(v, (list, tuple)):
+                stack.extend(v)
+            elif isinstance(v, str) and "swin" in v.lower():
+                return True
+    return False
+
+
+def _pred_extract(code: str, spec: Optional[dict]) -> bool:
+    return bool(
+        re.search(r"\bextract_patches\s*\(", code)
+        or re.search(r"\bpatch(?:_)?size\b", code, re.I)
+    )
+
+
+def _pred_roll(code: str, spec: Optional[dict]) -> bool:
+    return bool(re.search(r"\b(np\.)?roll\s*\(", code))
+
+
+def _pred_repeat_tile(code: str, spec: Optional[dict]) -> bool:
+    return bool(re.search(r"\b(np\.)?(repeat|tile)\s*\(", code))
+
+
+def _t_swin(code: str, spec: Optional[dict]) -> str:
+    return _ensure_swin_helpers(code)
+
+
+def _t_extract(code: str, spec: Optional[dict]) -> str:
+    return _ensure_extract_helper(code)
+
+
+def _t_roll(code: str, spec: Optional[dict]) -> str:
+    return _ensure_roll_helper(code)
+
+
+def _t_repeat_tile(code: str, spec: Optional[dict]) -> str:
+    return _ensure_repeat_tile_helper(code)
+
+
+_REGISTRY = [
+    Hardener("swin_helpers", _pred_swin, _t_swin, "semantic_lite"),
+    Hardener("extract_helper", _pred_extract, _t_extract, "semantic_lite"),
+    Hardener("roll_helper", _pred_roll, _t_roll, "semantic_lite"),
+    Hardener("repeat_tile_helper", _pred_repeat_tile, _t_repeat_tile, "semantic_lite"),
+]
+
+
+def _level_order(lv: HardeningLevel) -> int:
+    return {"syntax_only": 0, "semantic_lite": 1, "aggressive": 2}[lv]
+
+
+def apply_hardening(
+    code: str, spec: Optional[dict], policy: Optional[HardeningPolicy] = None
+) -> str:
+    policy = policy or HardeningPolicy(level="syntax_only")
+    lv = _level_order(policy.level)
+    for hz in _REGISTRY:
+        if _level_order(hz.min_level) > lv:
+            continue
+        if policy.allow and hz.name not in policy.allow:
+            continue
+        if policy.deny and hz.name in policy.deny:
+            continue
+        need = False
+        try:
+            need = hz.predicate(code, spec)
+        except Exception as e:
+            if policy.verbose:
+                print(f"[hardening:{hz.name}] predicate error: {e}")
+        if not need:
+            if policy.verbose:
+                print(f"[hardening:{hz.name}] skip")
+            continue
+        before = code
+        try:
+            code = hz.transform(code, spec)
+            if policy.verbose:
+                print(f"[hardening:{hz.name}] applied Δ={len(code)-len(before)}")
+        except Exception as e:
+            if policy.verbose:
+                print(f"[hardening:{hz.name}] transform error: {e}")
+    return code
+
+
+# ========== [HARDENING_ORCHESTRATOR_END] ==========
+
+
+# 안전 Concatenate 구현 (비-concat 축 길이 다르면 자동으로 최소 길이에 맞춰 크롭)
+_SAFE_CONCAT_SNIPPET = """
+def safe_concatenate(tensors, axis=-1):
+    import tensorflow as tf
+    t0 = tensors[0]
+    rank = t0.shape.rank or 3
+    if rank == 3:  # (B, L, C)
+        L = tf.reduce_min(tf.stack([tf.shape(t)[1] for t in tensors]))
+        tensors = [t[:, :L, :] for t in tensors]
+        return tf.concat(tensors, axis=axis)
+    elif rank == 4:  # (B, H, W, C)
+        H = tf.reduce_min(tf.stack([tf.shape(t)[1] for t in tensors]))
+        W = tf.reduce_min(tf.stack([tf.shape(t)[2] for t in tensors]))
+        tensors = [t[:, :H, :W, :] for t in tensors]
+        return tf.concat(tensors, axis=axis)
+    else:
+        flats = [tf.reshape(t, (tf.shape(t)[0], -1, tf.shape(t)[-1])) for t in tensors]
+        L = tf.reduce_min(tf.stack([tf.shape(t)[1] for t in flats]))
+        flats = [t[:, :L, :] for t in flats]
+        return tf.concat(flats, axis=axis)
+
+class SafeConcat(layers.Layer):
+    def __init__(self, axis=-1, **kwargs):
+        super().__init__(**kwargs)
+        self.axis = axis
+    def call(self, tensors):
+        return safe_concatenate(tensors, axis=self.axis)
+""".strip()
+
+
+def _ensure_safe_concat(src: str) -> str:
+    """
+    - 파일 내에 SafeConcat 정의가 없으면 주입
+    - layers.Concatenate(...) / Concatenate(...) 를 SafeConcat(...)으로 치환
+    """
+    s = src
+    if "class SafeConcat" not in s:
+        # seed 라인 뒤 or 파일 선두에 삽입
+        try:
+            i = s.index("tf.random.set_seed")
+            j = s.find("\n", i)
+            s = s[: j + 1] + "\n" + _SAFE_CONCAT_SNIPPET + "\n\n" + s[j + 1 :]
+        except Exception:
+            s = _SAFE_CONCAT_SNIPPET + "\n\n" + s
+    s = re.sub(r"\blayers\.Concatenate\s*\(", "SafeConcat(", s)
+    s = re.sub(r"(?<!\.)\bConcatenate\s*\(", "SafeConcat(", s)
+    return s
+
+
+def _inject_runtime_constants(src: str) -> str:
+    """
+    - PATCH_GRID 상수 삽입(없으면). 동적 shape에 numpy 연산 금지 대체용.
+    """
+    s = src
+    if "PATCH_GRID" not in s:
+        ins = "\nPATCH_GRID = int(globals().get('PATCH_GRID', 16))\n"
+        m = re.search(r"(\n\s*import[^\n]+\n(?:.*\n){0,8})", s)
+        s = s[: m.end()] + ins + s[m.end() :] if m else ins + s
+    return s
+
+
+def _harden_llm_src(src: str) -> str:
+    """
+    - 동적 텐서 shape에 numpy 연산 사용 제거(예: np.sqrt(x.shape[1]))
+    - keras.applications 사용 제거(외부 가중치 다운로드 방지)
+    - Concatenate 안전화(SafeConcat)
+    - PATCH_GRID 상수 보강
+    """
+    s = src
+    # numpy over shape 제거/치환
+    s = re.sub(
+        r"int\s*\(\s*np\.sqrt\s*\(\s*[A-Za-z_][\w\.]*\s*\.shape\s*\[\s*\d+\s*\]\s*\)\s*\)",
+        "PATCH_GRID",
+        s,
+        flags=re.I,
+    )
+    s = re.sub(
+        r"np\.sqrt\s*\(\s*[A-Za-z_][\w\.]*\s*\.shape\s*\[\s*\d+\s*\]\s*\)",
+        "float(PATCH_GRID)",
+        s,
+        flags=re.I,
+    )
+    # keras.applications 제거
+    s = re.sub(
+        r"^.*keras\.applications\..*$",
+        "# removed keras.applications import",
+        s,
+        flags=re.M,
+    )
+    s = re.sub(r"keras\.applications\.[A-Za-z0-9_\.]+", "layers.Conv2D", s)
+    # Concatenate → SafeConcat
+    s = _ensure_safe_concat(s)
+    # 상수 삽입
+    s = _inject_runtime_constants(s)
+    return s
+
+
+# === [PATCH: END · LLM 산출물 하드닝 헬퍼] ================================
+
+
+def _harden_seed_calls(src: str) -> str:
+    """
+    LLM/AST 결과에 실수로 들어간 TfCallLayer 기반 시드 호출을
+    정상적인 파이썬 레벨 호출로 복구.
+    """
+    import re
+
+    s = src
+    # TfCallLayer('random.set_seed')(seed)  →  tf.random.set_seed(seed)
+    s = re.sub(
+        r"TfCallLayer\(\s*['\"]random\.set_seed['\"]\s*\)\s*\(\s*([^)]+)\s*\)",
+        r"tf.random.set_seed(\1)",
+        s,
+        flags=re.I,
+    )
+    # TfCallLayer('keras.utils.set_random_seed')(seed) → tf.keras.utils.set_random_seed(seed)
+    s = re.sub(
+        r"TfCallLayer\(\s*['\"]keras\.utils\.set_random_seed['\"]\s*\)\s*\(\s*([^)]+)\s*\)",
+        r"tf.keras.utils.set_random_seed(\1)",
+        s,
+        flags=re.I,
+    )
+    return s

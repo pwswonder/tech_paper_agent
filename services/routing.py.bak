@@ -1,0 +1,469 @@
+# -*- coding: utf-8 -*-
+"""
+services/routing.py
+Purpose:
+  - 기술논문에서 추출된 spec(dict)을 받아 "어떤 템플릿 키를 쓸지" 결정한다.
+  - 다중 신호(family/subtype/task/modality/keywords)에 가중치를 부여해 점수화하고,
+    최고점 템플릿을 선택한다. 동점이면 rule.weight가 큰 규칙 우선.
+
+핵심 제공 함수:
+  - resolve_template_from_spec(spec) -> (template_key: str, meta: dict)
+
+통합 포인트:
+  - services/basecode_service.py 의 decide_model_key_from_spec()에서
+    이 모듈의 resolve_template_from_spec()을 먼저 호출한 뒤,
+    실패/미매칭 시 기존 보수적 분기로 폴백.
+
+주의:
+  - 여기서 리턴하는 template_key는 "파일명 prefix" (예: "transformer" -> services/templates/transformer.j2).
+  - 실제 파일 존재 여부는 codegen 단계에서 확인되고, 없으면 예외 발생.
+"""
+
+from typing import Any, Dict, List, Tuple
+from typing import Set
+
+import re
+
+def _detect_family_hints(kw_blob: str) -> Set[str]:
+    """
+    kw_blob에서 모델 가족 힌트를 추출한다.
+    반환 예: {'transformer'}, {'cnn','resnet'}, {'vit'}, {'unet','diffusion'} ...
+    """
+    if not isinstance(kw_blob, str):
+        return set()
+    t = kw_blob.lower()
+
+    hints: Set[str] = set()
+    # Transformer
+    if re.search(r"\b(transformer|self[- ]?attention|multi[- ]head)\b", t):
+        hints.add("transformer")
+    # CNN/ResNet 계열
+    if re.search(r"\b(cnn|convolution|resnet|vgg|densenet)\b", t):
+        hints.update({"cnn"})
+        if "resnet" in t: hints.add("resnet")
+        if "vgg" in t: hints.add("vgg")
+        if "densenet" in t: hints.add("densenet")
+    # ViT/Swin
+    if re.search(r"\b(vit|vision[- ]transformer|swin)\b", t):
+        hints.add("vit")
+        if "swin" in t: hints.add("swin")
+    # RNN/LSTM/GRU
+    if re.search(r"\b(rnn|lstm|gru)\b", t):
+        hints.add("rnn")
+    # GNN
+    if re.search(r"\b(gnn|graph neural)\b", t):
+        hints.add("gnn")
+    # UNet / Diffusion
+    if re.search(r"\b(u[- ]?net|unet)\b", t):
+        hints.add("unet")
+    if re.search(r"\b(diffusion|ddpm|score[- ]based)\b", t):
+        hints.add("diffusion")
+    # MLP/Linear
+    if re.search(r"\b(mlp|linear|dlinear|nlinear)\b", t):
+        hints.add("mlp")
+
+    return hints
+
+def _template_family(template_name: str) -> str:
+    """
+    템플릿 키를 상위 'family'로 매핑한다. 규칙 스코어링 페널티에 사용.
+    """
+    t = (template_name or "").strip().lower()
+    if t in {"transformer", "transformer_mt"}:
+        return "transformer"
+    if t in {"resnet", "cnn_family", "cnn"}:
+        return "cnn"
+    if t in {"vit", "swin"}:
+        return "vit"
+    if t in {"lstm", "rnn"}:
+        return "rnn"
+    if t in {"gnn"}:
+        return "gnn"
+    if t in {"unet", "diffusion"}:
+        return "unet"  # 상위로 묶기 애매하지만 구분 용도
+    if t in {"mlp"}:
+        return "mlp"
+    return ""  # family-less
+
+
+# -----------------------------------------------------------------------------
+# 0) 유틸: 정규화
+# -----------------------------------------------------------------------------
+def _norm(x: Any) -> str:
+    """널/비문자 입력을 안전하게 소문자 스트립 문자열로 변환."""
+    try:
+        return str(x or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def _norm_list(xs: Any) -> List[str]:
+    """리스트/튜플/단일값을 안전하게 소문자 리스트로."""
+    if isinstance(xs, (list, tuple)):
+        return [_norm(x) for x in xs]
+    return [_norm(xs)]
+
+
+# -----------------------------------------------------------------------------
+# 1) 선언형 라우팅 규칙 테이블
+#    - 각 규칙은 template, weight, family_any/subtype_any/task_any/keywords_any 중 일부를 포함.
+#    - weight가 클수록 우선순위 높음. score는 일치 조건별로 가산됨.
+# -----------------------------------------------------------------------------
+ROUTE_RULES: List[Dict[str, Any]] = [
+    # ===== Transformer 계열 =====
+    {
+        "template": "transformer_mt",
+        "weight": 120,
+        "family_any": [
+            "transformer_mt",
+            "transformer",
+            "TransformerMT",
+            "transformermt",
+        ],
+        "task_any": [
+            "machine_translation",
+            "translation",
+            "sequence_to_sequence",
+            "seq2seq",
+        ],
+        "subtype_any": [
+            "machine_translation",
+            "translation",
+            "encoderdecoder",
+            "seq2seq",
+        ],
+        "keywords_any": [
+            "machine translation",
+            "mt",
+            "encoder-decoder",
+            "encoder decoder",
+            "cross-attention",
+            "cross attention",
+            "autoregressive",
+            "teacher forcing",
+            "beam search",
+            "bleu",
+            "sacrebleu",
+            "source to target",
+            "src→tgt",
+            "src->tgt",
+        ],
+    },
+    {
+        "template": "transformer",
+        "weight": 90,
+        "family_any": ["transformer"],
+        "task_any": [
+            "machine_translation",
+            "sequence_to_sequence",
+            "text_generation",
+            "language_modeling",
+        ],
+        "subtype_any": ["encoderdecoder", "seq2seq"],
+        "keywords_any": [
+            "transformer",
+            "self-attention",
+            "multi-head",
+            "multihead",
+            "attention is all you need",
+        ],
+    },
+    # ===== ResNet/DenseNet =====
+    {
+        "template": "resnet",
+        "weight": 80,
+        "family_any": ["resnet", "densenet"],
+        "keywords_any": [
+            "resnet",
+            "residual",
+            "skip connection",
+            "densenet",
+            "bottleneck",
+        ],
+    },
+    # ===== CNN 패밀리(효율 모델 포함) =====
+    {
+        "template": "cnn_family",
+        "weight": 70,
+        "family_any": ["cnn", "vgg", "mobilenet", "efficientnet", "inception"],
+        "keywords_any": [
+            "convolution",
+            "convnet",
+            "vgg",
+            "mobilenet",
+            "efficientnet",
+            "mbconv",
+            "depthwise",
+            "inception",
+        ],
+    },
+    # ===== U-Net (세그멘테이션) =====
+    {
+        "template": "unet",
+        "weight": 75,
+        "family_any": ["unet"],
+        "task_any": ["segmentation"],
+        "keywords_any": [
+            "u-net",
+            "unet",
+            "segmentation",
+            "pixel-wise",
+            "dense prediction",
+        ],
+    },
+    # ===== RNN(LSTM/GRU) =====
+    {
+        "template": "rnn_seq",
+        "weight": 60,
+        "family_any": ["rnn", "lstm", "gru"],
+        "keywords_any": [
+            "recurrent",
+            "lstm",
+            "gru",
+            "sequence labeling",
+            "ctc",
+            "time series",
+        ],
+    },
+    # ===== AE/VAE/GAN =====
+    {
+        "template": "autoencoder",
+        "weight": 55,
+        "family_any": ["autoencoder", "ae"],
+        "keywords_any": ["autoencoder", "reconstruction", "denoising"],
+    },
+    {
+        "template": "vae",
+        "weight": 65,
+        "family_any": ["vae", "variational autoencoder"],
+        "keywords_any": [
+            "kl divergence",
+            "variational",
+            "reparameterization",
+            "latent prior",
+        ],
+    },
+    {
+        "template": "gan",
+        "weight": 65,
+        "family_any": ["gan"],
+        "keywords_any": [
+            "generative adversarial",
+            "discriminator",
+            "generator",
+            "minimax",
+        ],
+    },
+    # ===== 최종 폴백 =====
+    {"template": "mlp", "weight": 10, "keywords_any": ["mlp", "feedforward"]},
+]
+
+
+# -----------------------------------------------------------------------------
+# 2) spec에서 라우팅 신호 추출
+# -----------------------------------------------------------------------------
+def _extract_signals(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    family/subtype/task/modality + 키워드 blob을 구성한다.
+    - evidence: [{"text":..}, ...] or 그냥 문자열 리스트도 허용
+    - title/notes/baselines(name)도 키워드 집합에 포함
+    """
+    fam = _norm(spec.get("proposed_model_family"))
+    sub = _norm(spec.get("subtype"))
+    task = _norm(spec.get("task_type"))
+    mod = _norm(spec.get("data_modality") or spec.get("modality"))
+
+    # evidence 텍스트 수집
+    evid_texts: List[str] = []
+    evid = spec.get("evidence") or spec.get("_evidence_texts") or []
+    if isinstance(evid, (list, tuple)):
+        for ev in evid:
+            if isinstance(ev, dict):
+                evid_texts.append(_norm(ev.get("text")))
+            else:
+                evid_texts.append(_norm(ev))
+    else:
+        evid_texts.append(_norm(evid))
+
+    # title/notes
+    title = _norm(spec.get("title"))
+    notes = _norm(spec.get("notes"))
+
+    # baselines 리스트에서 name/notes 추출
+    base_blob = ""
+    bases = spec.get("baselines", [])
+    if isinstance(bases, (list, tuple)):
+        for b in bases:
+            if isinstance(b, dict):
+                base_blob += " " + _norm(b.get("name"))
+                base_blob += " " + _norm(b.get("notes"))
+            else:
+                base_blob += " " + _norm(b)
+
+    kw_blob = " ".join(evid_texts + [title, notes, base_blob])
+
+    return {
+        "family": fam,
+        "subtype": sub,
+        "task": task,
+        "modality": mod,
+        "kw_blob": kw_blob,
+    }
+
+
+# -----------------------------------------------------------------------------
+# 3) 규칙 스코어러 & 템플릿 해석
+# -----------------------------------------------------------------------------
+def _score_rule(rule: Dict[str, Any], sig: Dict[str, Any]) -> int:
+    """
+    규칙 일치 정도를 정수 점수로 환산.
+    - family_any 일치: +weight
+    - subtype_any 일치: +weight//2
+    - task_any 일치:    +weight//2
+    - keywords_any: 포함된 키워드마다 +weight//3
+    """
+    score = 0
+    W = int(rule.get("weight", 0))
+
+    fam = sig["family"]
+    sub = sig["subtype"]
+    task = sig["task"]
+    blob = sig["kw_blob"]
+
+    if "family_any" in rule and fam in _norm_list(rule["family_any"]):
+        score += W
+    if "subtype_any" in rule and sub in _norm_list(rule["subtype_any"]):
+        score += W // 2
+    if "task_any" in rule and task in _norm_list(rule["task_any"]):
+        score += W // 2
+    if "keywords_any" in rule:
+        for kw in _norm_list(rule["keywords_any"]):
+            if kw and kw in blob:
+                score += W // 3  # 여러 개면 누적 가산
+
+    return score
+
+
+from typing import Any, Dict, Tuple
+
+
+def resolve_template_from_spec(spec: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """
+    spec을 받아 최적의 템플릿 키를 선택한다.
+    returns:
+      - template_key: 예) "transformer", "cnn_family", "resnet", ...
+      - meta: {"score": int, "rule_index": int, "signals": {...}}
+    """
+    sig = _extract_signals(spec)
+
+    # -----------------------------
+    # [ADDED] 보수적 가드 조건 계산
+    # -----------------------------
+    fam = (
+        str((spec.get("family") or spec.get("proposed_model_family") or ""))
+        .strip()
+        .lower()
+    )
+    # data_modality 우선
+    modality = (
+        str((spec.get("data_modality") or spec.get("modality") or ""))
+        .strip()
+        .lower()
+    )
+    title = str(spec.get("title") or "")
+    tlow = title.lower()
+    kw_blob = str(sig.get("kw_blob") or "")
+
+    # 이미지 번역/디퓨전 힌트
+    image_translate_hint = any(
+        k in tlow or k in kw_blob.lower()
+        for k in ("image translation", "image-to-image", "style transfer")
+    )
+    diffusion_hint = any(k in tlow or k in kw_blob.lower() for k in ("diffusion", "ddpm", "score-based"))
+
+    # Transformer 차단 가드(이미지 번역/디퓨전 + family가 빈값/other)
+    guard_block_transformer = (
+        (fam in {"", "other"})
+        and (modality in {"image", "vision", "multimodal"})
+        and (image_translate_hint or diffusion_hint)
+    )
+
+    # [NEW] 가족 힌트 기반 가드: proposed=Other/빈값 + 강한 가족 힌트 없음 → 즉시 LLM 폴백
+    family_hints = _detect_family_hints(kw_blob)
+    guard_other_no_hints = (fam in {"", "other"}) and (len(family_hints) == 0)
+
+    # [FAST PATH] 가드 조건이면 즉시 LLM 폴백
+    if guard_block_transformer:
+        meta = {
+            "score": 0,
+            "rule_index": None,
+            "signals": sig,
+            "guard": "image_other_family",
+        }
+        return "LLM 풀백", meta
+
+    if guard_other_no_hints:
+        meta = {
+            "score": 0,
+            "rule_index": None,
+            "signals": sig,
+            "guard": "other_no_family_hints",
+        }
+        return "LLM 풀백", meta
+
+    # 초기값: 최하위 폴백
+    best_template = "LLM 풀백"
+    best_score = -1
+    best_idx = None
+
+    for i, rule in enumerate(ROUTE_RULES):
+        s = _score_rule(rule, sig)
+
+        # -----------------------------
+        # [ADDED] 루프 내부 하드 가드
+        # -----------------------------
+        tname = str(rule.get("template") or "").strip().lower()
+
+        # 1) Transformer/Transformer_MT 규칙 무효화
+        if guard_block_transformer and tname in {"transformer", "transformer_mt"}:
+            s = -(10**9)  # 사실상 탈락
+
+        # 2) proposed=Other/빈값인 경우: 가족 힌트 없는 템플릿은 실격
+        if fam in {"", "other"}:
+            tfam = _template_family(tname)
+            if tfam and (tfam not in family_hints):
+                s = -(10**9)
+
+        # 스코어 반영
+        if s > best_score:
+            best_template, best_score, best_idx = rule["template"], s, i
+        elif s == best_score:
+            # 동점이면 rule.weight가 큰 쪽 우선
+            curr_w = int(rule.get("weight", 0))
+            prev_w = (
+                int(ROUTE_RULES[best_idx].get("weight", 0))
+                if best_idx is not None
+                else -1
+            )
+            if curr_w > prev_w:
+                best_template, best_score, best_idx = rule["template"], s, i
+
+    # [핵심] 점수가 양수인 규칙이 하나도 없으면 폴백으로 처리
+    if best_score <= 0:
+        return "LLM 풀백", {"score": best_score, "rule_index": None, "signals": sig}
+
+    # -----------------------------
+    # [ADDED] 최종 후보가 Transformer 계열이라면 가드로 다시 차단
+    # -----------------------------
+    if guard_block_transformer and str(best_template).lower() in {
+        "transformer",
+        "transformer_mt",
+    }:
+        return "LLM 풀백", {
+            "score": best_score,
+            "rule_index": best_idx,
+            "signals": sig,
+            "guard": "override_transformer_to_llm",
+        }
+
+    return best_template, {"score": best_score, "rule_index": best_idx, "signals": sig}

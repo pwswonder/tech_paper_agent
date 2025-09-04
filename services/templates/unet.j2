@@ -1,0 +1,110 @@
+# -*- coding: utf-8 -*-
+# ============================================================================
+# Template: unet.j2
+# Purpose : U-Net for segmentation (Keras 3 safe)
+# ============================================================================
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+# {% raw %}{{CUSTOM_BLOCK:imports_extra}}{% endraw %}
+
+# ---------------------------
+# 1) 하이퍼파라미터 (spec에서 주입)
+# ---------------------------
+input_shape   = {{ dims.input_shape  | default([256, 256, 1]) | pylit }}
+num_classes   = {{ dims.num_classes  | default(2) }}
+base_filters  = {{ dims.base_filters | default(64) }}
+depth         = {{ dims.depth        | default(4) }}
+use_batchnorm = {{ dims.use_batchnorm | default(True) | pylit }}
+dropout_rate  = {{ dims.dropout      | default(0.0) }}
+use_transpose = {{ dims.use_transpose | default(True) | pylit }}  # True: Conv2DTranspose, False: UpSampling2D
+
+learning_rate  = {{ learning_rate | default(1e-3) }}
+optimizer_name = {{ optimizer_name | default("adam") | tojson }}
+metrics        = {{ metrics | default(['accuracy']) | tojson }}
+# 분류/세그먼트 기본 로스는 codegen이 보정하지만, 템플릿에서도 기본 제공
+loss_fn        = {{ loss | default("sparse_categorical_crossentropy") | tojson }}
+
+# ---------------------------
+# 2) 블록 정의 (모두 레이어 조합으로 구현)
+# ---------------------------
+def conv_block(x, filters, name, use_bn=True, drop=0.0):
+    x = layers.Conv2D(filters, 3, padding="same", name=f"{name}_conv1")(x)
+    if use_bn:
+        x = layers.BatchNormalization(name=f"{name}_bn1")(x)
+    x = layers.Activation("relu", name=f"{name}_relu1")(x)
+    if drop and drop > 0.0:
+        x = layers.Dropout(drop, name=f"{name}_drop1")(x)
+    x = layers.Conv2D(filters, 3, padding="same", name=f"{name}_conv2")(x)
+    if use_bn:
+        x = layers.BatchNormalization(name=f"{name}_bn2")(x)
+    x = layers.Activation("relu", name=f"{name}_relu2")(x)
+    return x
+
+def up_block(x, skip, filters, name, use_tconv=True):
+    if use_tconv:
+        x = layers.Conv2DTranspose(filters, 2, strides=2, padding="same", name=f"{name}_up")(x)
+    else:
+        x = layers.UpSampling2D(size=(2, 2), interpolation="bilinear", name=f"{name}_up")(x)
+        x = layers.Conv2D(filters, 1, padding="same", name=f"{name}_up_proj")(x)
+    # 스킵 연결 (concatenate)
+    x = layers.Concatenate(name=f"{name}_concat")([x, skip])
+    x = conv_block(x, filters, name=f"{name}_conv", use_bn=use_batchnorm, drop=0.0)
+    return x
+
+# ---------------------------
+# 3) 모델 구성
+# ---------------------------
+def build_model():
+    inputs = keras.Input(shape=tuple(input_shape), name="image")
+
+    # Encoder path
+    skips = []
+    x = inputs
+    f = base_filters
+    # {% raw %}{{CUSTOM_BLOCK:encoder_blocks}}{% endraw %}
+    for d in range(depth):
+        x = conv_block(x, f, name=f"enc{d}", use_bn=use_batchnorm, drop=dropout_rate if d==0 else 0.0)
+        skips.append(x)
+        x = layers.MaxPooling2D(pool_size=(2, 2), name=f"enc{d}_pool")(x)
+        f *= 2
+
+    # Bottleneck
+    x = conv_block(x, f, name="bottleneck", use_bn=use_batchnorm, drop=dropout_rate)
+
+    # Decoder path
+    # {% raw %}{{CUSTOM_BLOCK:decoder_blocks}}{% endraw %}
+    for d in reversed(range(depth)):
+        f //= 2
+        x = up_block(x, skips[d], f, name=f"dec{d}", use_tconv=use_transpose)
+
+    # Head
+    if num_classes == 1:
+        activation = "sigmoid"
+        out_channels = 1
+    else:
+        activation = "softmax"
+        out_channels = num_classes
+
+    # {% raw %}{{CUSTOM_BLOCK:head}}{% endraw %}
+    outputs = layers.Conv2D(out_channels, 1, padding="same", activation=activation, name="segmentation_head")(x)
+
+    model = keras.Model(inputs, outputs, name="unet")
+
+    # Optimizer
+    optimizer = optimizer_name
+    if isinstance(optimizer_name, str):
+        low = optimizer_name.lower()
+        if low == "adam":
+            optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
+        elif low == "sgd":
+            optimizer = keras.optimizers.SGD(learning_rate=learning_rate, momentum=0.9)
+        elif low == "rmsprop":
+            optimizer = keras.optimizers.RMSprop(learning_rate=learning_rate)
+        else:
+            optimizer = keras.optimizers.get(optimizer_name)
+
+    # {% raw %}{{CUSTOM_BLOCK:compile_override}}{% endraw %}
+    model.compile(optimizer=optimizer, loss=loss_fn, metrics=metrics)
+    return model

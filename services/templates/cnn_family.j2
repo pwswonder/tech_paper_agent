@@ -1,0 +1,215 @@
+# -*- coding: utf-8 -*-
+# ============================================================================
+# Template: cnn_family.j2
+# Purpose : CNN 패밀리(standard/Depthwise/MBConv, VGG/Inception-like 포함) 범용 베이스코드
+# Notes   :
+#   - compile(loss, metrics)는 상위 codegen._harden_metrics() 결과를 그대로 사용.
+#   - LLM 보조 슬롯:
+#       # {% raw %}{{CUSTOM_BLOCK:se_squeeze_excitation}}{% endraw %}
+#       # {% raw %}{{CUSTOM_BLOCK:stochastic_depth}}{% endraw %}
+#       # {% raw %}{{CUSTOM_BLOCK:inception_mixed}}{% endraw %}
+# ============================================================================
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+# {% raw %}{{CUSTOM_BLOCK:imports_extra}}{% endraw %}
+
+# ---------------------------
+# 1) Injected hyperparameters (with safe defaults)
+# ---------------------------
+# 입력/출력
+input_shape   = {{ input_shape | default([224, 224, 3]) | tojson }}
+num_classes   = {{ num_classes | default(1000) }}
+# 학습 관련
+learning_rate = {{ learning_rate | default(1e-3) }}
+optimizer_name= {{ optimizer_name | default("adam") | tojson }}
+metrics       = {{ metrics | default(['accuracy']) | tojson }}
+loss_fn       = {{ loss | default("sparse_categorical_crossentropy") | tojson }}
+# 구조 관련 (dims.* 사용)
+stem_filters  = {{ (dims.stem_filters  | default(32))  }}
+stage_blocks  = {{ (dims.stage_blocks  | default([2, 2, 2])) | tojson }}  # stage별 블록 수
+stage_filters = {{ (dims.stage_filters | default([64, 128, 256])) | tojson }}  # stage별 채널
+dropout_rate  = {{ (dims.dropout       | default(0.2)) }}
+conv_type     = {{ (dims.conv_type     | default("standard")) | tojson }}  # "standard" | "depthwise" | "mbconv"
+block_style   = {{ (dims.block_style   | default("vanilla"))  | tojson }}  # "vanilla" | "vgg" | "inception_like" | "efficient_like"
+se_ratio      = {{ (dims.se_ratio      | default(0.0)) }}
+expansion     = {{ (dims.expansion     | default(4)) }}
+stoch_depth_p = {{ (dims.stochastic_depth_p | default(0.0)) }}
+
+# ---------------------------
+# 2) Utility blocks
+# ---------------------------
+def conv_bn_act(x, filters, kernel_size=3, stride=1, groups=1, name=None):
+    """표준 Conv-BN-Activation 블록"""
+    x = layers.Conv2D(filters, kernel_size, strides=stride, padding="same",
+                      use_bias=False, groups=groups, name=None if name is None else name+"_conv")(x)
+    x = layers.BatchNormalization(momentum=0.99, epsilon=1e-3,
+                      name=None if name is None else name+"_bn")(x)
+    x = layers.Activation("relu", name=None if name is None else name+"_relu")(x)
+    return x
+
+def dw_separable_conv(x, filters, stride=1, name=None):
+    """Depthwise separable conv (MobileNet v1 스타일)"""
+    x = layers.DepthwiseConv2D(3, strides=stride, padding="same", use_bias=False,
+                               name=None if name is None else name+"_dw")(x)
+    x = layers.BatchNormalization(momentum=0.99, epsilon=1e-3,
+                                  name=None if name is None else name+"_dw_bn")(x)
+    x = layers.Activation("relu", name=None if name is None else name+"_dw_relu")(x)
+    x = layers.Conv2D(filters, 1, padding="same", use_bias=False,
+                      name=None if name is None else name+"_pw")(x)
+    x = layers.BatchNormalization(momentum=0.99, epsilon=1e-3,
+                                  name=None if name is None else name+"_pw_bn")(x)
+    x = layers.Activation("relu", name=None if name is None else name+"_pw_relu")(x)
+    return x
+
+def se_block(x, ratio=0.25, name=None):
+    """Squeeze-and-Excitation (간단 버전) — 필요 시 슬롯으로 대체가능"""
+    filters = x.shape[-1]
+    if filters is None:
+        return x
+    squeeze = layers.GlobalAveragePooling2D(name=None if name is None else name+"_gap")(x)
+    squeeze = layers.Reshape((1,1,filters))(squeeze)
+    reduce = max(8, int(filters * ratio))
+    z = layers.Conv2D(reduce, 1, activation="relu", name=None if name is None else name+"_fc1")(squeeze)
+    z = layers.Conv2D(filters, 1, activation="sigmoid", name=None if name is None else name+"_fc2")(z)
+    return layers.Multiply(name=None if name is None else name+"_scale")([x, z])
+
+def maybe_se(x, ratio, name=None):
+    if ratio and ratio > 0.0:
+        # 슬롯 우선(있으면 대체), 없으면 기본 se_block 사용
+        # {% raw %}{{CUSTOM_BLOCK:se_squeeze_excitation}}{% endraw %}
+        try:
+            return se_block(x, ratio=ratio, name=name)
+        except Exception:
+            return x
+    return x
+
+def stochastic_depth(x, p_drop, training=False, name=None):
+    """간단 DropPath (stochastic depth). 슬롯으로 대체 가능."""
+    # {% raw %}{{CUSTOM_BLOCK:stochastic_depth}}{% endraw %}
+    if not training or p_drop <= 0.0:
+        return x
+    keep_prob = 1.0 - p_drop
+    # shape broadcast
+    shape = (tf.shape(x)[0],) + (1,) * (len(x.shape) - 1)
+    random_tensor = keep_prob + tf.random.uniform(shape, 0, 1)
+    binary_tensor = tf.floor(random_tensor)
+    return (x / keep_prob) * binary_tensor
+
+def mbconv_block(x, out_ch, stride=1, expansion=4, se_ratio=0.25, train_flag=False, name=None):
+    """MBConv-like (EfficientNet 스타일 간이 구현)"""
+    in_ch = x.shape[-1]
+    hidden = int(in_ch * expansion)
+    h = conv_bn_act(x, hidden, kernel_size=1, stride=1, name=None if name is None else name+"_expand")
+    # depthwise
+    h = layers.DepthwiseConv2D(3, strides=stride, padding="same", use_bias=False,
+                               name=None if name is None else name+"_dw")(h)
+    h = layers.BatchNormalization(momentum=0.99, epsilon=1e-3,
+                                  name=None if name is None else name+"_dw_bn")(h)
+    h = layers.Activation("swish", name=None if name is None else name+"_dw_swish")(h)
+    # SE
+    if se_ratio and se_ratio > 0.0:
+        h = maybe_se(h, ratio=se_ratio, name=None if name is None else name+"_se")
+    # project
+    h = layers.Conv2D(out_ch, 1, padding="same", use_bias=False,
+                      name=None if name is None else name+"_project")(h)
+    h = layers.BatchNormalization(momentum=0.99, epsilon=1e-3,
+                                  name=None if name is None else name+"_project_bn")(h)
+    # residual (stride=1 & in_ch==out_ch)
+    if stride == 1 and (in_ch == out_ch):
+        h = layers.Add(name=None if name is None else name+"_add")([x, h])
+        # stochastic depth (train only)
+        h = layers.Lambda(lambda t: stochastic_depth(t, p_drop=stoch_depth_p, training=train_flag),
+                          name=None if name is None else name+"_sd")(h)
+    return h
+
+# ---------------------------
+# 3) Model factory
+# ---------------------------
+def build_backbone(x, train_flag):
+    """
+    conv_type: "standard" | "depthwise" | "mbconv"
+    block_style: "vanilla" | "vgg" | "inception_like" | "efficient_like"
+    """
+    # Stem
+    x = conv_bn_act(x, int(stem_filters), kernel_size=3, stride=2, name="stem")  # 224->112
+    x = layers.MaxPool2D(3, strides=2, padding="same", name="stem_pool")(x)      # 112->56
+
+    # Stages
+    # {% raw %}{{CUSTOM_BLOCK:stages}}{% endraw %}
+    for s, (blocks, filters) in enumerate(zip(list(stage_blocks), list(stage_filters))):
+        # 다운샘플 첫 블록 stride=2 (stage 0 제외)
+        stride = 1 if s == 0 else 2
+
+        for b in range(int(blocks)):
+            b_name = f"stage{s}_block{b}"
+            curr_stride = stride if b == 0 else 1
+
+            if block_style == "inception_like":
+                # Inception-like는 슬롯으로 위임(필요 시 기본 fallback 제공 가능)
+                # {% raw %}{{CUSTOM_BLOCK:inception_mixed}}{% endraw %}
+                # 기본 fallback: 간단 conv 두 번
+                x = conv_bn_act(x, int(filters), kernel_size=3, stride=curr_stride, name=b_name+"_inc_fallback1")
+                x = conv_bn_act(x, int(filters), kernel_size=3, stride=1,           name=b_name+"_inc_fallback2")
+                continue
+
+            if conv_type == "mbconv" or block_style == "efficient_like":
+                x = mbconv_block(x, int(filters), stride=curr_stride,
+                                 expansion=int(expansion), se_ratio=float(se_ratio),
+                                 train_flag=train_flag, name=b_name)
+            elif conv_type == "depthwise":
+                # depthwise separable conv 2회
+                x = dw_separable_conv(x, int(filters), stride=curr_stride, name=b_name+"_dw1")
+                x = dw_separable_conv(x, int(filters), stride=1,           name=b_name+"_dw2")
+                # 선택적 SE
+                if se_ratio and se_ratio > 0.0:
+                    x = maybe_se(x, ratio=float(se_ratio), name=b_name+"_se")
+            else:
+                # standard conv (VGG-like 대응: conv 두 번)
+                x = conv_bn_act(x, int(filters), kernel_size=3, stride=curr_stride, name=b_name+"_c1")
+                x = conv_bn_act(x, int(filters), kernel_size=3, stride=1,           name=b_name+"_c2")
+                # 선택적 SE
+                if se_ratio and se_ratio > 0.0:
+                    x = maybe_se(x, ratio=float(se_ratio), name=b_name+"_se")
+    return x
+
+def classifier_head(x):
+    x = layers.GlobalAveragePooling2D(name="gap")(x)
+    if float(dropout_rate) > 0:
+        x = layers.Dropout(float(dropout_rate), name="dropout")(x)
+    # {% raw %}{{CUSTOM_BLOCK:head}}{% endraw %}
+    x = layers.Dense(int(num_classes), activation="softmax" if int(num_classes) > 1 else None, name="head")(x)
+    return x
+
+# ---------------------------
+# 4) Entry
+# ---------------------------
+def build_model():
+    """Builds and compiles a generic CNN-family model (classification/regression)."""
+    inputs = keras.Input(shape=tuple(input_shape), name="inputs")
+    x = inputs
+    x = build_backbone(x, train_flag=True)
+    outputs = classifier_head(x)
+
+    model = keras.Model(inputs, outputs, name="cnn_family")
+
+    # optimizer 인스턴스화
+    opt = optimizer_name
+    if isinstance(optimizer_name, str):
+        name = optimizer_name.lower()
+        if name == "adam":
+            opt = keras.optimizers.Adam(learning_rate=learning_rate)
+        elif name == "sgd":
+            opt = keras.optimizers.SGD(learning_rate=learning_rate, momentum=0.9)
+        elif name == "rmsprop":
+            opt = keras.optimizers.RMSprop(learning_rate=learning_rate)
+        else:
+            try:
+                opt = keras.optimizers.get(optimizer_name)
+            except Exception:
+                opt = keras.optimizers.Adam(learning_rate=learning_rate)
+
+    # {% raw %}{{CUSTOM_BLOCK:compile_override}}{% endraw %}
+    model.compile(optimizer=opt, loss=loss_fn, metrics=metrics)
+    return model

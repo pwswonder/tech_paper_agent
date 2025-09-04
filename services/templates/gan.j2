@@ -1,0 +1,141 @@
+# -*- coding: utf-8 -*-
+# ============================================================================
+# Template: gan.j2
+# Purpose : Minimal GAN (DCGAN-like) — custom train_step (Keras Model subclass)
+# Notes   :
+#   - GAN은 compile(loss, metrics)만으로 부족 → custom train_step 사용.
+#   - dims.*
+#       * latent_dim   : noise z 차원 (기본 128)
+#       * img_shape    : 생성 이미지 크기 (기본 [64,64,3])
+#       * gen_channels : 생성기 채널 베이스 (기본 256)
+#       * disc_channels: 판별기 채널 베이스 (기본 64)
+#       * dropout      : 판별기 dropout
+#   - LLM 슬롯:
+#       # {% raw %}{{CUSTOM_BLOCK:gan_loss}}{% endraw %}            (hinge, wgan-gp, r1 등 대체)
+#       # {% raw %}{{CUSTOM_BLOCK:discriminator_block}}{% endraw %} (판별기 블록 커스터마이즈)
+# ============================================================================
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+# {% raw %}{{CUSTOM_BLOCK:imports_extra}}{% endraw %}
+
+# ---------------------------
+# 1) Injected hyperparameters
+# ---------------------------
+latent_dim     = {{ (dims.latent_dim    | default(128)) }}
+img_shape      = {{ (dims.img_shape     | default([64, 64, 3])) | tojson }}
+gen_ch         = {{ (dims.gen_channels  | default(256)) }}
+disc_ch        = {{ (dims.disc_channels | default(64)) }}
+dropout_rate   = {{ (dims.dropout       | default(0.0)) }}
+learning_rate  = {{ learning_rate | default(2e-4) }}
+beta1          = {{ (dims.beta1         | default(0.5)) }}
+beta2          = {{ (dims.beta2         | default(0.999)) }}
+
+# ---------------------------
+# 2) Generator / Discriminator
+# ---------------------------
+def build_generator():
+    """DCGAN-like upsampling generator."""
+    H, W, C = tuple(img_shape)
+    s = H // 16  # assume square & divisible by 16
+    inputs = keras.Input(shape=(int(latent_dim),), name="z")
+    x = layers.Dense(int(gen_ch) * s * s, use_bias=False, name="g_dense")(inputs)
+    x = layers.Reshape((s, s, int(gen_ch)), name="g_reshape")(x)
+
+    # {% raw %}{{CUSTOM_BLOCK:generator_blocks}}{% endraw %}
+    for i, ch in enumerate([gen_ch, gen_ch//2, gen_ch//4, gen_ch//8]):
+        x = layers.Conv2DTranspose(int(ch), 4, strides=2, padding="same", use_bias=False, name=f"g_deconv{i+1}")(x)
+        x = layers.BatchNormalization(name=f"g_bn{i+1}")(x)
+        x = layers.ReLU(name=f"g_relu{i+1}")(x)
+
+    outputs = layers.Conv2D(C, 3, padding="same", activation="tanh", name="g_tanh")(x)
+    return keras.Model(inputs, outputs, name="generator")
+
+def d_block(x, ch, stride, name):
+    # {% raw %}{{CUSTOM_BLOCK:discriminator_block}}{% endraw %}
+    x = layers.Conv2D(int(ch), 4, strides=stride, padding="same", use_bias=False, name=name+"_conv")(x)
+    x = layers.LeakyReLU(0.2, name=name+"_lrelu")(x)
+    if float(dropout_rate) > 0.0:
+        x = layers.Dropout(float(dropout_rate), name=name+"_drop")(x)
+    return x
+
+def build_discriminator():
+    inputs = keras.Input(shape=tuple(img_shape), name="img")
+    x = inputs
+    for i, (ch, s) in enumerate([(disc_ch,2), (disc_ch*2,2), (disc_ch*4,2), (disc_ch*8,2)]):
+        x = d_block(x, ch, s, name=f"d{i+1}")
+    x = layers.Flatten(name="d_flat")(x)
+    logits = layers.Dense(1, name="d_logits")(x)
+    return keras.Model(inputs, logits, name="discriminator")
+
+# ---------------------------
+# 3) GAN Model (custom train_step)
+# ---------------------------
+class GAN(keras.Model):
+    def __init__(self, generator, discriminator, **kwargs):
+        super().__init__(**kwargs)
+        self.generator = generator
+        self.discriminator = discriminator
+        self.d_loss_tracker = keras.metrics.Mean(name="d_loss")
+        self.g_loss_tracker = keras.metrics.Mean(name="g_loss")
+
+    @property
+    def metrics(self):
+        return [self.d_loss_tracker, self.g_loss_tracker]
+
+    def compile(self, g_optimizer, d_optimizer, loss_fn):
+        super().compile()
+        self.g_opt = g_optimizer
+        self.d_opt = d_optimizer
+        self.loss_fn = loss_fn
+
+    def train_step(self, real_images):
+        batch_size = tf.shape(real_images)[0]
+        random_latent = tf.random.normal(shape=(batch_size, int(latent_dim)))
+
+        # 1) Train Discriminator
+        with tf.GradientTape() as tape:
+            fake_images = self.generator(random_latent, training=True)
+            real_logits = self.discriminator(real_images, training=True)
+            fake_logits = self.discriminator(fake_images, training=True)
+
+            # {% raw %}{{CUSTOM_BLOCK:gan_loss}}{% endraw %}
+            # 기본: non-saturating logistic loss
+            d_loss_real = keras.losses.binary_crossentropy(tf.ones_like(real_logits), real_logits, from_logits=True)
+            d_loss_fake = keras.losses.binary_crossentropy(tf.zeros_like(fake_logits), fake_logits, from_logits=True)
+            d_loss = tf.reduce_mean(d_loss_real + d_loss_fake)
+
+        grads = tape.gradient(d_loss, self.discriminator.trainable_variables)
+        self.d_opt.apply_gradients(zip(grads, self.discriminator.trainable_variables))
+
+        # 2) Train Generator
+        random_latent = tf.random.normal(shape=(batch_size, int(latent_dim)))
+        with tf.GradientTape() as tape:
+            fake_images = self.generator(random_latent, training=True)
+            fake_logits = self.discriminator(fake_images, training=True)
+            g_loss = tf.reduce_mean(
+                keras.losses.binary_crossentropy(tf.ones_like(fake_logits), fake_logits, from_logits=True)
+            )
+
+        grads = tape.gradient(g_loss, self.generator.trainable_variables)
+        self.g_opt.apply_gradients(zip(grads, self.generator.trainable_variables))
+
+        self.d_loss_tracker.update_state(d_loss)
+        self.g_loss_tracker.update_state(g_loss)
+        return {"d_loss": self.d_loss_tracker.result(), "g_loss": self.g_loss_tracker.result()}
+
+# ---------------------------
+# 4) Entry
+# ---------------------------
+def build_model():
+    G = build_generator()
+    D = build_discriminator()
+
+    g_opt = keras.optimizers.Adam(learning_rate=learning_rate, beta_1=float(beta1), beta_2=float(beta2))
+    d_opt = keras.optimizers.Adam(learning_rate=learning_rate, beta_1=float(beta1), beta_2=float(beta2))
+
+    gan = GAN(G, D, name="gan")
+    # {% raw %}{{CUSTOM_BLOCK:compile_override}}{% endraw %}
+    gan.compile(g_optimizer=g_opt, d_optimizer=d_opt, loss_fn=None)  # loss_fn은 슬롯로 대체 가능
+    return gan

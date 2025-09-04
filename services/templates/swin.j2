@@ -1,0 +1,16 @@
+# -*- coding: utf-8 -*-
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+# {CUSTOM_BLOCK:imports_extra}
+
+def build_swin_like(input_shape=(224,224,3), num_classes=1000, patch_size=4, embed_dim=96):
+    inputs = keras.Input(shape=input_shape, name="image")
+    x = layers.Conv2D(embed_dim, patch_size, strides=patch_size, padding="same", use_bias=False, name="patch_embed_conv")(inputs)
+    x = layers.BatchNormalization(name="patch_embed_bn")(x)
+    # {CUSTOM_BLOCK:stages}
+    x = layers.GlobalAveragePooling2D(name="gap")(x)
+    outputs = layers.Dense(num_classes, activation="softmax", name="head")(x)
+    model = keras.Model(inputs, outputs, name="swin_like")
+    return model

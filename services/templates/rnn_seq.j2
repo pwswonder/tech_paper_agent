@@ -1,0 +1,169 @@
+# -*- coding: utf-8 -*-
+# ============================================================================
+# Template: rnn_seq.j2
+# Purpose : RNN 계열(LSTM/GRU 공용) 시퀀스 모델 (분류/회귀/시퀀스 라벨링)
+# Notes   :
+#   - compile(loss, metrics)는 상위 codegen._harden_metrics() 결과를 그대로 사용.
+#   - 옵션 개요 (dims.*):
+#       * cell_type: "lstm" | "gru"                  (기본: "lstm")
+#       * num_layers: 스택 레이어 수                 (기본: 2)
+#       * hidden_dim: 히든 크기                      (기본: 128)
+#       * dropout: 드롭아웃 비율                     (기본: 0.1)
+#       * bidirectional: 양방향 사용 여부            (기본: True)
+#       * seq_labeling: 시퀀스 라벨링 여부           (기본: False) -> TimeDistributed head
+#       * use_attention: 어텐션 사용 여부            (기본: False) -> 슬롯/폴백 주의
+#       * use_mask: 앞단 Masking 레이어 사용         (기본: True)  -> 0-패딩 마스킹 가정
+#   - LLM 보조 슬롯:
+#       # {% raw %}{{CUSTOM_BLOCK:attention_mech}}{% endraw %}   (Bahdanau/Luong 등 자유 구현)
+#       # {% raw %}{{CUSTOM_BLOCK:schedule}}{% endraw %}         (teacher forcing/scheduled sampling 등 훈련 스케줄 힌트)
+# ============================================================================
+
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+# {% raw %}{{CUSTOM_BLOCK:imports_extra}}{% endraw %}
+
+# ---------------------------
+# 1) Injected hyperparameters (safe defaults)
+# ---------------------------
+# 입력/출력
+input_shape    = {{ input_shape | default([100, 64]) | tojson }}   # (timesteps, features)
+num_classes    = {{ num_classes | default(1) }}
+
+# 학습 관련
+learning_rate  = {{ learning_rate | default(1e-3) }}
+optimizer_name = {{ optimizer_name | default("adam") | tojson }}
+metrics        = {{ metrics | default(['mse']) | tojson }}
+loss_fn        = {{ loss | default("mse") | tojson }}
+
+# 구조 관련 (dims.*)
+cell_type      = {{ (dims.cell_type      | default("lstm")) | tojson }}     # "lstm" | "gru"
+num_layers     = {{ (dims.num_layers     | default(2)) }}
+hidden_dim     = {{ (dims.hidden_dim     | default(128)) }}
+dropout_rate   = {{ (dims.dropout        | default(0.1)) }}
+bidirectional  = {{ (dims.bidirectional  | default(True)) | tojson }}
+seq_labeling   = {{ (dims.seq_labeling   | default(False)) | tojson }}
+use_attention  = {{ (dims.use_attention  | default(False)) | tojson }}
+use_mask       = {{ (dims.use_mask       | default(True)) | tojson }}
+
+# ---------------------------
+# 2) Attention (fallback) — 슬롯 대체 가능
+# ---------------------------
+def simple_additive_attention(seq, name="attn"):
+    """
+    간단한 additive attention (학습 가능한 점수벡터로 시퀀스 가중합)
+    seq: (B, T, H)
+    반환: (B, H)
+    """
+    # {% raw %}{{CUSTOM_BLOCK:attention_mech}}{% endraw %}
+    # 기본 fallback 구현:
+    score = layers.Dense(1, use_bias=False, name=name+"_score")(seq)   # (B,T,1)
+    score = layers.Softmax(axis=1, name=name+"_softmax")(score)        # 시간이 axis=1
+    context = layers.Multiply(name=name+"_scale")([seq, score])        # (B,T,H)
+    context = layers.Lambda(lambda t: tf.reduce_sum(t, axis=1), name=name+"_sum")(context)  # (B,H)
+    return context
+
+# ---------------------------
+# 3) RNN 스택 유틸
+# ---------------------------
+def make_rnn(return_sequences, name):
+    ct = str(cell_type).lower()
+    common = dict(units=int(hidden_dim),
+                  dropout=float(dropout_rate),
+                  recurrent_dropout=0.0,
+                  return_sequences=bool(return_sequences),
+                  name=name)
+    if ct == "gru":
+        cell = layers.GRU(**common)
+    else:
+        cell = layers.LSTM(**common)
+    if bool(bidirectional):
+        cell = layers.Bidirectional(cell, name=name+"_bi")
+    return cell
+
+def rnn_stack(x):
+    """
+    num_layers 만큼 RNN을 스택.
+    - 마지막 레이어의 return_sequences는 seq_labeling/attention 여부에 따라 결정
+    """
+    L = int(num_layers)
+    if L <= 0:
+        return x
+
+    # 마지막 레이어가 시퀀스 출력이 필요한지 결정
+    need_seq_out = bool(seq_labeling) or bool(use_attention)
+
+    # {% raw %}{{CUSTOM_BLOCK:rnn_stack}}{% endraw %}
+    for i in range(L):
+        last = (i == L - 1)
+        rs = bool(need_seq_out) if last else True
+        x = make_rnn(return_sequences=rs, name=f"rnn{i+1}")(x)
+    return x
+
+# ---------------------------
+# 4) Heads
+# ---------------------------
+def classification_head(x):
+    """시퀀스 분류/회귀: (B,H) -> (B,num_classes)"""
+    # 주: attention이 True면 x가 (B,T,H). attention pooling으로 (B,H)로 축약
+    if bool(use_attention):
+        x = simple_additive_attention(x, name="attn_pool")
+    x = layers.Dense(int(num_classes),
+                     activation=("softmax" if int(num_classes) > 1 and loss_fn != "mse" else None),
+                     name="head")(x)
+    return x
+
+def sequence_labeling_head(x):
+    """시퀀스 라벨링: (B,T,H) -> (B,T,num_classes)"""
+    # TimeDistributed Dense
+    y = layers.TimeDistributed(
+        layers.Dense(int(num_classes), activation=("softmax" if int(num_classes) > 1 and loss_fn != "mse" else None)),
+        name="td_head")(x)
+    return y
+
+# ---------------------------
+# 5) Entry
+# ---------------------------
+def build_model():
+    """Builds and compiles a generic RNN (LSTM/GRU) model."""
+    inputs = keras.Input(shape=tuple(input_shape), name="inputs")
+
+    x = inputs
+    if bool(use_mask):
+        # 0-패딩 가정 마스킹
+        x = layers.Masking(mask_value=0.0, name="mask")(x)
+
+    # RNN stack
+    x = rnn_stack(x)
+
+    # {% raw %}{{CUSTOM_BLOCK:head}}{% endraw %}
+    # Head 선택
+    if bool(seq_labeling):
+        outputs = sequence_labeling_head(x)      # (B,T,C)
+    else:
+        outputs = classification_head(x)         # (B,C) (또는 회귀면 C=1)
+
+    model = keras.Model(inputs, outputs, name=f"rnn_{str(cell_type).lower()}")
+
+    # [슬롯] 훈련 스케줄/콜백 힌트(코드 블록으로 치환될 수 있음; 기본은 무시)
+    # {% raw %}{{CUSTOM_BLOCK:schedule}}{% endraw %}
+
+    # optimizer 인스턴스화
+    opt = optimizer_name
+    if isinstance(optimizer_name, str):
+        name = optimizer_name.lower()
+        if name == "adam":
+            opt = keras.optimizers.Adam(learning_rate=learning_rate)
+        elif name == "sgd":
+            opt = keras.optimizers.SGD(learning_rate=learning_rate, momentum=0.9)
+        elif name == "rmsprop":
+            opt = keras.optimizers.RMSprop(learning_rate=learning_rate)
+        else:
+            try:
+                opt = keras.optimizers.get(optimizer_name)
+            except Exception:
+                opt = keras.optimizers.Adam(learning_rate=learning_rate)
+
+    # {% raw %}{{CUSTOM_BLOCK:compile_override}}{% endraw %}
+    model.compile(optimizer=opt, loss=loss_fn, metrics=metrics)
+    return model
